@@ -1,13 +1,17 @@
+//! Search backend trait and types.
+
 use std::path::PathBuf;
 
 use crate::corpus::Corpus;
 
+/// Options for filtering and limiting search results.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     pub limit: Option<usize>,
     pub category: Option<String>,
 }
 
+/// A single search result with match context.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: PathBuf,
@@ -17,6 +21,7 @@ pub struct SearchResult {
     pub score: Option<f32>,
 }
 
+/// Trait for search backends (ripgrep, tantivy, etc.).
 pub trait SearchBackend: Send + Sync {
     fn search(
         &self,

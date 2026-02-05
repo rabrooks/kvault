@@ -1,21 +1,43 @@
-use std::path::PathBuf;
+//! Knowledge corpus management and manifest parsing.
+
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
+/// Errors that can occur when loading a corpus.
+#[derive(Debug, Error)]
+pub enum CorpusError {
+    #[error("Manifest not found at {0}")]
+    ManifestNotFound(PathBuf),
+
+    #[error("Failed to read manifest: {0}")]
+    ReadError(#[from] std::io::Error),
+
+    #[error("Failed to parse manifest: {0}")]
+    ParseError(#[from] serde_json::Error),
+}
+
+/// A knowledge document with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub path: PathBuf,
     pub title: String,
     pub category: String,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
+/// The manifest.json structure listing all documents in a corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    #[serde(default)]
     pub documents: Vec<Document>,
 }
 
+/// A loaded knowledge corpus with its root path and manifest.
 #[derive(Debug, Clone)]
 pub struct Corpus {
     pub root: PathBuf,
@@ -23,7 +45,37 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    pub fn load(_path: &PathBuf) -> anyhow::Result<Self> {
-        todo!("Implement corpus loading in Phase 2")
+    /// Load a corpus from a directory containing manifest.json.
+    pub fn load(root: &Path) -> Result<Self, CorpusError> {
+        let manifest_path = root.join("manifest.json");
+
+        if !manifest_path.exists() {
+            return Err(CorpusError::ManifestNotFound(manifest_path));
+        }
+
+        let contents = fs::read_to_string(&manifest_path)?;
+        let manifest: Manifest = serde_json::from_str(&contents)?;
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            manifest,
+        })
+    }
+
+    pub fn resolve_document_path(&self, doc: &Document) -> PathBuf {
+        self.root.join(&doc.path)
+    }
+
+    pub fn documents(&self) -> &[Document] {
+        &self.manifest.documents
+    }
+}
+
+impl Manifest {
+    pub fn empty() -> Self {
+        Self {
+            version: "1".to_string(),
+            documents: vec![],
+        }
     }
 }
