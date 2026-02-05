@@ -23,6 +23,11 @@ pub struct SearchResult {
 
 /// Trait for search backends (ripgrep, tantivy, etc.).
 pub trait SearchBackend: Send + Sync {
+    /// Search the corpus for documents matching the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the search operation fails.
     fn search(
         &self,
         query: &str,
@@ -30,7 +35,13 @@ pub trait SearchBackend: Send + Sync {
         options: &SearchOptions,
     ) -> anyhow::Result<Vec<SearchResult>>;
 
+    /// Build or update the search index for the corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if indexing fails.
     fn index(&self, corpus: &Corpus) -> anyhow::Result<()>;
 
+    /// Returns true if this backend requires indexing before search.
     fn needs_indexing(&self) -> bool;
 }

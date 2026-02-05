@@ -24,3 +24,8 @@ toml = "0.9.11"
 default = []
 tantivy = ["dep:tantivy"]
 mcp = ["dep:rmcp", "dep:tokio"]
+
+[lints.clippy]
+pedantic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"

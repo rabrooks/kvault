@@ -46,6 +46,12 @@ pub struct Corpus {
 
 impl Corpus {
     /// Load a corpus from a directory containing manifest.json.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CorpusError::ManifestNotFound` if manifest.json doesn't exist.
+    /// Returns `CorpusError::ReadError` if the file cannot be read.
+    /// Returns `CorpusError::ParseError` if the JSON is invalid.
     pub fn load(root: &Path) -> Result<Self, CorpusError> {
         let manifest_path = root.join("manifest.json");
 
@@ -62,16 +68,19 @@ impl Corpus {
         })
     }
 
+    #[must_use]
     pub fn resolve_document_path(&self, doc: &Document) -> PathBuf {
         self.root.join(&doc.path)
     }
 
+    #[must_use]
     pub fn documents(&self) -> &[Document] {
         &self.manifest.documents
     }
 }
 
 impl Manifest {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             version: "1".to_string(),
