@@ -1,5 +1,7 @@
 //! Search backend trait and types.
 
+pub mod ripgrep;
+
 use std::path::PathBuf;
 
 use crate::corpus::Corpus;

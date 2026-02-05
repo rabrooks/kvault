@@ -4,19 +4,29 @@ Searchable knowledge corpus with BM25 ranking. Rust library, CLI, and MCP server
 
 ## Status
 
-Early development — CLI functional, search in progress.
+Early development — CLI and search functional, MCP server in progress.
 
 ## What is kvault?
 
 kvault is a fast, local-first knowledge base that lets you:
 
 - **Store** knowledge as Markdown, JSON, or plain text
-- **Search** with ranked results using BM25 (powered by Tantivy)
+- **Search** with ripgrep (fast) or BM25 ranking (coming soon)
 - **Access** via CLI, Rust library, or MCP server
 
 No external AI services. No embeddings APIs. You control where your knowledge lives.
 
 ## Installation
+
+Requires [ripgrep](https://github.com/BurntSushi/ripgrep) for search:
+
+```bash
+brew install ripgrep    # macOS
+cargo install ripgrep   # any platform
+apt install ripgrep     # Debian/Ubuntu
+```
+
+Install kvault:
 
 ```bash
 cargo install kvault
@@ -54,20 +64,22 @@ mkdir -p ~/.claude/knowledge/aws
 }
 ```
 
-3. Add your knowledge documents, then list them:
+3. Add your knowledge documents, then search:
 
 ```bash
 kvault list
+kvault search "lambda"
 kvault get aws/lambda-patterns.md
 ```
 
 ## CLI Commands
 
 ```
+kvault search <query>          # Search the corpus
+kvault search <query> -l 5     # Limit results
 kvault list                    # List all documents
 kvault list --category aws     # Filter by category
 kvault get <path>              # Print document contents
-kvault search <query>          # Search the corpus (coming soon)
 ```
 
 ## Configuration
@@ -90,6 +102,13 @@ Default paths are used if no config file exists.
 |---------|----------|--------|
 | Local filesystem | CLI users, scripts, personal knowledge | ✓ |
 | S3 | Team sharing, distributed corpus | Planned |
+
+## Search Backends
+
+| Backend | Use Case | Status |
+|---------|----------|--------|
+| ripgrep | Fast text search, no indexing needed | ✓ |
+| Tantivy | BM25 ranked results, requires indexing | Planned |
 
 ## Editor Integration
 

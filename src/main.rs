@@ -1,7 +1,6 @@
 use clap::Parser;
 use kvault::cli::{Cli, Commands};
-use kvault::config::{Config, expand_tilde};
-use kvault::corpus::Corpus;
+use kvault::commands;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -11,14 +10,48 @@ fn main() -> anyhow::Result<()> {
             query,
             limit,
             category,
-            scope,
+            scope: _,
         }) => {
-            println!(
-                "Searching for '{query}' (limit: {limit}, category: {category:?}, scope: {scope})"
-            );
-            todo!("Implement search in Phase 3")
+            let results = commands::search(&query, limit, category)?;
+
+            if results.is_empty() {
+                println!("No matches found for '{query}'");
+                return Ok(());
+            }
+
+            for result in &results {
+                println!(
+                    "{}: {} (line {})",
+                    result.title,
+                    result.path.display(),
+                    result.line_number
+                );
+                println!("  {}", result.matched_line);
+            }
+
+            println!("\n{} result(s) found", results.len());
+            Ok(())
         }
-        Some(Commands::List { category, scope }) => list_documents(category, &scope),
+        Some(Commands::List { category, scope: _ }) => {
+            let documents = commands::list(category.as_deref())?;
+
+            if documents.is_empty() {
+                println!("No documents found.");
+                return Ok(());
+            }
+
+            for doc in &documents {
+                let tags = if doc.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", doc.tags.join(", "))
+                };
+                println!("{}: {}{tags}", doc.category, doc.title);
+                println!("  {}", doc.path.display());
+            }
+
+            Ok(())
+        }
         Some(Commands::Add {
             title,
             category,
@@ -31,7 +64,11 @@ fn main() -> anyhow::Result<()> {
             );
             todo!("Implement add in Phase 5")
         }
-        Some(Commands::Get { path }) => get_document(&path),
+        Some(Commands::Get { path }) => {
+            let content = commands::get(&path)?;
+            print!("{content}");
+            Ok(())
+        }
         #[cfg(feature = "mcp")]
         Some(Commands::Serve) => tokio::runtime::Runtime::new()?.block_on(kvault::mcp::serve()),
         None => {
@@ -39,80 +76,4 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-#[allow(clippy::needless_pass_by_value)] // Will refactor when implementing scope
-fn list_documents(category: Option<String>, _scope: &str) -> anyhow::Result<()> {
-    let config = Config::load()?;
-
-    let mut found_any = false;
-
-    for path_str in &config.corpus.paths {
-        let path = expand_tilde(path_str);
-
-        if !path.exists() {
-            continue;
-        }
-
-        match Corpus::load(&path) {
-            Ok(corpus) => {
-                for doc in corpus.documents() {
-                    if let Some(ref cat) = category
-                        && &doc.category != cat
-                    {
-                        continue;
-                    }
-
-                    found_any = true;
-                    let tags = if doc.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", doc.tags.join(", "))
-                    };
-                    println!("{}: {}{tags}", doc.category, doc.title);
-                    println!("  {}", corpus.resolve_document_path(doc).display());
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: Could not load corpus at {}: {e}", path.display());
-            }
-        }
-    }
-
-    if !found_any {
-        println!("No documents found.");
-        println!("Searched paths:");
-        for path_str in &config.corpus.paths {
-            let path = expand_tilde(path_str);
-            let status = if path.exists() { "exists" } else { "not found" };
-            println!("  {} ({status})", path.display());
-        }
-    }
-
-    Ok(())
-}
-
-fn get_document(doc_path: &str) -> anyhow::Result<()> {
-    let config = Config::load()?;
-
-    for path_str in &config.corpus.paths {
-        let corpus_path = expand_tilde(path_str);
-
-        if !corpus_path.exists() {
-            continue;
-        }
-
-        if let Ok(corpus) = Corpus::load(&corpus_path) {
-            for doc in corpus.documents() {
-                if doc.path.to_string_lossy() == doc_path {
-                    let full_path = corpus.resolve_document_path(doc);
-                    let content = std::fs::read_to_string(&full_path)?;
-                    print!("{content}");
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    anyhow::bail!("Document not found: {doc_path}")
 }
