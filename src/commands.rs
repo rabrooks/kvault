@@ -1,9 +1,13 @@
 //! Command implementations shared by CLI and MCP server.
 
+use std::path::PathBuf;
+
 use crate::config::{Config, expand_tilde};
-use crate::corpus::Corpus;
+use crate::corpus::{Corpus, Document};
 use crate::search::ripgrep::RipgrepBackend;
 use crate::search::{SearchBackend, SearchOptions, SearchResult};
+use crate::storage::StorageBackend;
+use crate::storage::local::LocalStorageBackend;
 
 /// Search across all configured corpora.
 ///
@@ -115,4 +119,76 @@ pub struct DocumentInfo {
     pub category: String,
     pub tags: Vec<String>,
     pub path: std::path::PathBuf,
+}
+
+/// Result of adding a document.
+#[derive(Debug, Clone)]
+pub struct AddResult {
+    pub path: PathBuf,
+    pub title: String,
+    pub category: String,
+}
+
+/// Add a new document to the knowledge corpus.
+///
+/// # Errors
+///
+/// Returns an error if config loading fails, storage operations fail,
+/// or no corpus path is configured.
+pub fn add(
+    title: &str,
+    content: &str,
+    category: &str,
+    tags: Vec<String>,
+) -> anyhow::Result<AddResult> {
+    let config = Config::load()?;
+
+    let corpus_path = config
+        .corpus
+        .paths
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No corpus path configured"))?;
+
+    let root = expand_tilde(corpus_path);
+    let storage = LocalStorageBackend::new(root.clone());
+
+    let mut manifest = storage.read_manifest()?;
+
+    let slug = slugify(title);
+    let doc_path = PathBuf::from(category).join(format!("{slug}.md"));
+
+    if storage.exists(&doc_path) {
+        anyhow::bail!("Document already exists: {}", doc_path.display());
+    }
+
+    storage.write_document(&doc_path, content)?;
+
+    let document = Document {
+        path: doc_path.clone(),
+        title: title.to_string(),
+        category: category.to_string(),
+        tags,
+    };
+
+    manifest.documents.push(document);
+    storage.write_manifest(&manifest)?;
+
+    Ok(AddResult {
+        path: root.join(&doc_path),
+        title: title.to_string(),
+        category: category.to_string(),
+    })
+}
+
+/// Convert a title to a URL-safe slug.
+fn slugify(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }

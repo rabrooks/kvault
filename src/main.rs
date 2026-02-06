@@ -57,10 +57,31 @@ fn main() -> anyhow::Result<()> {
             tags,
             file,
         }) => {
-            println!(
-                "Adding document '{title}' (category: {category}, tags: {tags:?}, file: {file:?})"
-            );
-            todo!("Implement add in Phase 5")
+            let content = if let Some(path) = file {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read file {path}: {e}"))?
+            } else {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            };
+
+            if content.trim().is_empty() {
+                anyhow::bail!("Content cannot be empty");
+            }
+
+            let tag_list: Vec<String> = tags
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default();
+
+            let result = commands::add(&title, &content, &category, tag_list)?;
+
+            println!("Added: {}", result.title);
+            println!("  Category: {}", result.category);
+            println!("  Path: {}", result.path.display());
+
+            Ok(())
         }
         Some(Commands::Get { path }) => {
             let content = commands::get(&path)?;
