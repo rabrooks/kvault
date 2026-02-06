@@ -112,21 +112,15 @@ pub fn get(doc_path: &str) -> anyhow::Result<String> {
     anyhow::bail!("Document not found: {doc_path}")
 }
 
-/// Information about a document for listing.
+/// Information about a document with resolved path.
+///
+/// Used for list and add results. The path is absolute (resolved from corpus root).
 #[derive(Debug, Clone)]
 pub struct DocumentInfo {
     pub title: String,
     pub category: String,
     pub tags: Vec<String>,
-    pub path: std::path::PathBuf,
-}
-
-/// Result of adding a document.
-#[derive(Debug, Clone)]
-pub struct AddResult {
     pub path: PathBuf,
-    pub title: String,
-    pub category: String,
 }
 
 /// Add a new document to the knowledge corpus.
@@ -140,7 +134,7 @@ pub fn add(
     content: &str,
     category: &str,
     tags: Vec<String>,
-) -> anyhow::Result<AddResult> {
+) -> anyhow::Result<DocumentInfo> {
     let config = Config::load()?;
 
     let corpus_path = config
@@ -167,16 +161,17 @@ pub fn add(
         path: doc_path.clone(),
         title: title.to_string(),
         category: category.to_string(),
-        tags,
+        tags: tags.clone(),
     };
 
     manifest.documents.push(document);
     storage.write_manifest(&manifest)?;
 
-    Ok(AddResult {
-        path: root.join(&doc_path),
+    Ok(DocumentInfo {
         title: title.to_string(),
         category: category.to_string(),
+        tags,
+        path: root.join(&doc_path),
     })
 }
 

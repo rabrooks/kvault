@@ -7,7 +7,7 @@ pub mod local;
 
 use std::path::Path;
 
-use crate::corpus::{Document, Manifest};
+use crate::corpus::Manifest;
 
 /// Errors that can occur during storage operations.
 #[derive(Debug, thiserror::Error)]
@@ -63,10 +63,4 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get the root path/identifier for this storage backend.
     fn root(&self) -> &Path;
-}
-
-/// Result of adding a document to storage.
-pub struct AddDocumentResult {
-    pub document: Document,
-    pub full_path: std::path::PathBuf,
 }

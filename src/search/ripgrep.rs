@@ -80,6 +80,13 @@ impl SearchBackend for RipgrepBackend {
     }
 }
 
+/// Parsed match from ripgrep JSON output.
+struct RgMatch {
+    path: PathBuf,
+    matched_line: String,
+    line_number: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct RgMessage {
     #[serde(rename = "type")]
@@ -89,19 +96,30 @@ struct RgMessage {
 
 #[derive(Debug, Deserialize)]
 struct RgMatchData {
-    path: Option<RgPath>,
-    lines: Option<RgLines>,
+    path: Option<RgText>,
+    lines: Option<RgText>,
     line_number: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RgPath {
+struct RgText {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RgLines {
-    text: String,
+/// Parse a single line of ripgrep JSON output into a match.
+fn parse_rg_line(line: &str) -> Option<RgMatch> {
+    let msg: RgMessage = serde_json::from_str(line).ok()?;
+
+    if msg.msg_type != "match" {
+        return None;
+    }
+
+    let data = msg.data?;
+    Some(RgMatch {
+        path: PathBuf::from(&data.path?.text),
+        matched_line: data.lines?.text.trim().to_string(),
+        line_number: data.line_number?,
+    })
 }
 
 fn parse_ripgrep_output(
@@ -115,57 +133,36 @@ fn parse_ripgrep_output(
         .map(|d| (corpus.resolve_document_path(d), d))
         .collect();
 
-    let mut results = Vec::new();
-
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-
-        let msg: RgMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if msg.msg_type != "match" {
-            continue;
-        }
-
-        let Some(data) = msg.data else { continue };
-        let Some(path_data) = data.path else { continue };
-        let Some(lines_data) = data.lines else {
-            continue;
-        };
-        let Some(line_number) = data.line_number else {
-            continue;
-        };
-
-        let path = PathBuf::from(&path_data.text);
-
-        let (title, category) = if let Some(doc) = doc_map.get(&path) {
-            (doc.title.clone(), doc.category.clone())
-        } else {
-            let title = path.file_stem().map_or_else(
-                || "Unknown".to_string(),
-                |s| s.to_string_lossy().to_string(),
+    let mut results: Vec<SearchResult> = output
+        .lines()
+        .filter_map(parse_rg_line)
+        .filter_map(|m| {
+            let (title, category) = doc_map.get(&m.path).map_or_else(
+                || {
+                    let title = m.path.file_stem().map_or_else(
+                        || "Unknown".to_string(),
+                        |s| s.to_string_lossy().to_string(),
+                    );
+                    (title, "unknown".to_string())
+                },
+                |doc| (doc.title.clone(), doc.category.clone()),
             );
-            (title, "unknown".to_string())
-        };
 
-        if let Some(ref cat) = options.category
-            && &category != cat
-        {
-            continue;
-        }
+            if let Some(ref cat) = options.category
+                && &category != cat
+            {
+                return None;
+            }
 
-        results.push(SearchResult {
-            path,
-            title,
-            matched_line: lines_data.text.trim().to_string(),
-            line_number,
-            score: None,
-        });
-    }
+            Some(SearchResult {
+                path: m.path,
+                title,
+                matched_line: m.matched_line,
+                line_number: m.line_number,
+                score: None,
+            })
+        })
+        .collect();
 
     if let Some(limit) = options.limit {
         results.truncate(limit);

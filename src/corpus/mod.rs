@@ -20,11 +20,17 @@ pub enum CorpusError {
 }
 
 /// A knowledge document with metadata.
+///
+/// Stored in manifest.json. The path is relative to the corpus root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
+    /// Path relative to corpus root (e.g., "aws/lambda-patterns.md").
     pub path: PathBuf,
+    /// Human-readable document title.
     pub title: String,
+    /// Category for grouping (e.g., "aws", "rust", "devops").
     pub category: String,
+    /// Optional tags for additional classification.
     #[serde(default)]
     pub tags: Vec<String>,
 }
