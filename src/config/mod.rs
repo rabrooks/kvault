@@ -20,10 +20,7 @@ pub struct CorpusConfig {
 }
 
 fn default_corpus_paths() -> Vec<String> {
-    vec![
-        "~/.claude/knowledge".to_string(),
-        "./.claude/knowledge".to_string(),
-    ]
+    vec!["~/.kvault".to_string()]
 }
 
 impl Default for CorpusConfig {

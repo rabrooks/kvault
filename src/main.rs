@@ -10,7 +10,6 @@ fn main() -> anyhow::Result<()> {
             query,
             limit,
             category,
-            scope: _,
         }) => {
             let results = commands::search(&query, limit, category)?;
 
@@ -32,7 +31,7 @@ fn main() -> anyhow::Result<()> {
             println!("\n{} result(s) found", results.len());
             Ok(())
         }
-        Some(Commands::List { category, scope: _ }) => {
+        Some(Commands::List { category }) => {
             let documents = commands::list(category.as_deref())?;
 
             if documents.is_empty() {
@@ -56,11 +55,10 @@ fn main() -> anyhow::Result<()> {
             title,
             category,
             tags,
-            scope,
             file,
         }) => {
             println!(
-                "Adding document '{title}' (category: {category}, tags: {tags:?}, scope: {scope}, file: {file:?})"
+                "Adding document '{title}' (category: {category}, tags: {tags:?}, file: {file:?})"
             );
             todo!("Implement add in Phase 5")
         }

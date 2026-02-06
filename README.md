@@ -45,7 +45,7 @@ cargo build --release
 1. Create a knowledge corpus:
 
 ```bash
-mkdir -p ~/.claude/knowledge/aws
+mkdir -p ~/.kvault/aws
 ```
 
 2. Add a manifest.json:
@@ -89,12 +89,13 @@ Config file: `~/.config/kvault/config.toml`
 ```toml
 [corpus]
 paths = [
-  "~/.claude/knowledge",      # global knowledge
-  "./.claude/knowledge",      # project-specific
+  "~/.kvault",              # default location
+  "./.kvault",              # add project-specific paths as needed
+  "~/work/shared-kb",       # or team/custom locations
 ]
 ```
 
-Default paths are used if no config file exists.
+Default: `~/.kvault` is used if no config file exists.
 
 ## Storage Backends
 

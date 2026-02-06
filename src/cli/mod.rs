@@ -19,20 +19,12 @@ pub enum Commands {
 
         #[arg(short, long)]
         category: Option<String>,
-
-        /// all, global, or project
-        #[arg(short, long, default_value = "all")]
-        scope: String,
     },
 
     /// List documents in the corpus
     List {
         #[arg(short, long)]
         category: Option<String>,
-
-        /// all, global, or project
-        #[arg(short, long, default_value = "all")]
-        scope: String,
     },
 
     /// Add a document to the corpus
@@ -46,10 +38,6 @@ pub enum Commands {
         /// Comma-separated
         #[arg(short = 'T', long)]
         tags: Option<String>,
-
-        /// global or project
-        #[arg(short, long, default_value = "global")]
-        scope: String,
 
         /// Read content from file instead of stdin
         #[arg(short, long)]
