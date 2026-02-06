@@ -42,39 +42,35 @@ cargo build --release
 
 ## Quick Start
 
-1. Create a knowledge corpus:
+Add a document:
 
 ```bash
-mkdir -p ~/.kvault/aws
+echo "# Lambda Patterns
+
+Use environment variables for configuration.
+Keep functions small and focused.
+" | kvault add --title "AWS Lambda Patterns" --category aws --tags "lambda,serverless"
 ```
 
-2. Add a manifest.json:
-
-```json
-{
-  "version": "1",
-  "documents": [
-    {
-      "path": "aws/lambda-patterns.md",
-      "title": "AWS Lambda Patterns",
-      "category": "aws",
-      "tags": ["lambda", "serverless"]
-    }
-  ]
-}
-```
-
-3. Add your knowledge documents, then search:
+Or from a file:
 
 ```bash
-kvault list
-kvault search "lambda"
-kvault get aws/lambda-patterns.md
+kvault add --title "AWS Lambda Patterns" --category aws --file ./notes.md
+```
+
+Then search and retrieve:
+
+```bash
+kvault list                           # List all documents
+kvault search "environment"           # Search content
+kvault get aws/aws-lambda-patterns.md # View full document
 ```
 
 ## CLI Commands
 
 ```
+kvault add --title "..." --category "..." [--tags "..."] [--file path]
+                               # Add document (reads stdin if no --file)
 kvault search <query>          # Search the corpus
 kvault search <query> -l 5     # Limit results
 kvault list                    # List all documents
