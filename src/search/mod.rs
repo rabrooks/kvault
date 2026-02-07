@@ -13,6 +13,8 @@ pub struct SearchOptions {
     pub limit: Option<usize>,
     /// Filter results to this category only.
     pub category: Option<String>,
+    /// Use case-sensitive matching (default is case-insensitive).
+    pub case_sensitive: bool,
 }
 
 /// A single search result with match context.

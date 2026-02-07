@@ -9,10 +9,18 @@ use serde::Deserialize;
 use crate::corpus::{Corpus, Document};
 use crate::search::{SearchBackend, SearchOptions, SearchResult};
 
+/// Maximum allowed query length to prevent abuse.
+const MAX_QUERY_LENGTH: usize = 1000;
+
 /// Search backend using ripgrep for fast text search.
+///
+/// Uses `--fixed-strings` mode to treat queries as literal text rather than
+/// regex patterns, preventing regex denial-of-service attacks and unexpected behavior.
+#[derive(Default)]
 pub struct RipgrepBackend;
 
 impl RipgrepBackend {
+    /// Create a new ripgrep search backend.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -37,12 +45,6 @@ impl RipgrepBackend {
     }
 }
 
-impl Default for RipgrepBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SearchBackend for RipgrepBackend {
     fn search(
         &self,
@@ -52,14 +54,42 @@ impl SearchBackend for RipgrepBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         Self::check_available()?;
 
+        // Validate query to prevent abuse
         if query.is_empty() {
             return Ok(vec![]);
         }
 
-        let output = Command::new("rg")
-            .arg("--json")
+        if query.len() > MAX_QUERY_LENGTH {
+            anyhow::bail!(
+                "Query too long: {} chars (max {})",
+                query.len(),
+                MAX_QUERY_LENGTH
+            );
+        }
+
+        // Reject queries with null bytes (could cause issues with C-based tools)
+        if query.contains('\0') {
+            anyhow::bail!("Query contains invalid characters");
+        }
+
+        let mut cmd = Command::new("rg");
+        cmd.arg("--json")
+            // Use fixed-strings to treat query as literal text, not regex.
+            // This prevents ReDoS attacks and unexpected regex behavior.
+            .arg("--fixed-strings")
+            // Exclude manifest.json from search results
+            .arg("--glob")
+            .arg("!manifest.json")
             .arg("--max-count")
-            .arg(options.limit.unwrap_or(100).to_string())
+            .arg(options.limit.unwrap_or(100).to_string());
+
+        // Case-insensitive by default, unless --case-sensitive is specified
+        if !options.case_sensitive {
+            cmd.arg("--ignore-case");
+        }
+
+        let output = cmd
+            .arg("--") // End of options, query follows
             .arg(query)
             .arg(&corpus.root)
             .output()?;

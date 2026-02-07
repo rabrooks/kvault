@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use clap::Parser;
 use kvault::cli::{Cli, Commands};
 use kvault::commands;
@@ -10,8 +12,9 @@ fn main() -> anyhow::Result<()> {
             query,
             limit,
             category,
+            case_sensitive,
         }) => {
-            let results = commands::search(&query, limit, category)?;
+            let results = commands::search(&query, limit, category, case_sensitive)?;
 
             if results.is_empty() {
                 println!("No matches found for '{query}'");
@@ -61,7 +64,6 @@ fn main() -> anyhow::Result<()> {
                 std::fs::read_to_string(&path)
                     .map_err(|e| anyhow::anyhow!("Failed to read file {path}: {e}"))?
             } else {
-                use std::io::Read;
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
                 buf
@@ -71,9 +73,7 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Content cannot be empty");
             }
 
-            let tag_list: Vec<String> = tags
-                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default();
+            let tag_list = commands::parse_tags(tags);
 
             let result = commands::add(&title, &content, &category, tag_list)?;
 

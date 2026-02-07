@@ -4,7 +4,7 @@ Searchable knowledge corpus with BM25 ranking. Rust library, CLI, and MCP server
 
 ## Status
 
-Early development — CLI and search functional, MCP server in progress.
+CLI, search, and MCP server are functional. Tantivy (BM25) search backend planned.
 
 ## What is kvault?
 
@@ -38,6 +38,9 @@ Or build from source:
 git clone https://github.com/aaronbrooks/kvault
 cd kvault
 cargo build --release
+
+# With MCP server support
+cargo build --release --features mcp
 ```
 
 ## Quick Start
@@ -71,11 +74,14 @@ kvault get aws/aws-lambda-patterns.md # View full document
 ```
 kvault add --title "..." --category "..." [--tags "..."] [--file path]
                                # Add document (reads stdin if no --file)
-kvault search <query>          # Search the corpus
+kvault search <query>          # Search the corpus (case-insensitive)
 kvault search <query> -l 5     # Limit results
+kvault search <query> -c aws   # Filter by category
+kvault search <query> -s       # Case-sensitive search
 kvault list                    # List all documents
 kvault list --category aws     # Filter by category
 kvault get <path>              # Print document contents
+kvault serve                   # Start MCP server (requires --features mcp)
 ```
 
 ## Configuration
@@ -93,28 +99,35 @@ paths = [
 
 Default: `~/.kvault` is used if no config file exists.
 
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `KVAULT_CONFIG` | Override config file location (useful for testing) |
+
 ## Storage Backends
 
 | Backend | Use Case | Status |
 |---------|----------|--------|
-| Local filesystem | CLI users, scripts, personal knowledge | ✓ |
+| Local filesystem | CLI users, scripts, personal knowledge | Available |
 | S3 | Team sharing, distributed corpus | Planned |
 
 ## Search Backends
 
 | Backend | Use Case | Status |
 |---------|----------|--------|
-| ripgrep | Fast text search, no indexing needed | ✓ |
+| ripgrep | Fast text search, no indexing needed | Available |
 | Tantivy | BM25 ranked results, requires indexing | Planned |
 
-## Editor Integration
+## MCP Server
 
-kvault exposes an MCP server that works with any editor supporting the Model Context Protocol:
+kvault includes an MCP server for AI editor integration. Build with MCP support:
 
-- Claude Code
-- Cursor
-- Windsurf
-- opencode
+```bash
+cargo build --release --features mcp
+```
+
+Add to your editor's MCP configuration:
 
 ```json
 {
@@ -127,7 +140,28 @@ kvault exposes an MCP server that works with any editor supporting the Model Con
 }
 ```
 
-MCP server support is in development.
+### Supported Editors
+
+- Claude Code
+- Cursor
+- Windsurf
+- Any editor supporting the Model Context Protocol
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_knowledge` | Search the corpus for matching documents |
+| `list_knowledge` | List all documents, optionally filtered by category |
+| `get_document` | Get full contents of a document by path |
+| `add_knowledge` | Add a new document to the corpus |
+
+## Feature Flags
+
+| Flag | Description |
+|------|-------------|
+| `mcp` | Enable MCP server (`kvault serve`) |
+| `tantivy` | Enable Tantivy BM25 search backend (planned) |
 
 ## License
 
