@@ -2,10 +2,23 @@
 //!
 //! Provides command-line argument parsing using clap.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Default number of search results to return.
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+
+/// Search backend selection.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum Backend {
+    /// Use ripgrep for fast text search (default).
+    #[default]
+    Ripgrep,
+    /// Use Tantivy for BM25 ranked search (requires `ranked` feature).
+    #[cfg(feature = "ranked")]
+    Ranked,
+    /// Automatically select based on corpus size and index availability.
+    Auto,
+}
 
 /// Command-line interface for kvault.
 #[derive(Parser)]
@@ -36,6 +49,15 @@ pub enum Commands {
         /// Use case-sensitive matching (default is case-insensitive).
         #[arg(short = 's', long)]
         case_sensitive: bool,
+
+        /// Search backend to use.
+        #[arg(short, long, default_value = "ripgrep")]
+        backend: Backend,
+
+        /// Enable fuzzy search with specified edit distance (1-2).
+        /// Only available with the `ranked` backend.
+        #[arg(short, long)]
+        fuzzy: Option<u8>,
     },
 
     /// List all documents in the corpus.
@@ -69,6 +91,11 @@ pub enum Commands {
         /// Document path (e.g., "aws/lambda-patterns.md").
         path: String,
     },
+
+    /// Build or rebuild the search index for all corpora.
+    /// Requires the `ranked` feature.
+    #[cfg(feature = "ranked")]
+    Index,
 
     /// Start the MCP server for AI editor integration.
     #[cfg(feature = "mcp")]

@@ -258,6 +258,7 @@ mod search_tests {
                 limit: Some(10),
                 category: None,
                 case_sensitive: false,
+                fuzzy: None,
             },
         );
 
@@ -319,6 +320,7 @@ mod search_tests {
                 limit: Some(10),
                 category: Some("rust".to_string()),
                 case_sensitive: false,
+                fuzzy: None,
             },
         );
 

@@ -2,12 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli::Backend;
 use crate::config::{Config, expand_tilde};
 use crate::corpus::{Corpus, Document};
 use crate::search::ripgrep::RipgrepBackend;
 use crate::search::{SearchBackend, SearchOptions, SearchResult};
 use crate::storage::StorageBackend;
 use crate::storage::local::LocalStorageBackend;
+
+#[cfg(feature = "ranked")]
+use crate::search::tantivy::{IndexMode, TantivyBackend};
 
 /// Maximum length for user-provided strings (title, category, etc.).
 const MAX_INPUT_LENGTH: usize = 200;
@@ -134,6 +138,8 @@ pub fn parse_tags(tags: Option<String>) -> Vec<String> {
 /// * `limit` - Maximum number of results to return
 /// * `category` - Optional category filter
 /// * `case_sensitive` - Use case-sensitive matching (default is case-insensitive)
+/// * `backend` - Search backend to use (ripgrep, ranked, or auto)
+/// * `fuzzy` - Optional fuzzy search edit distance (only for ranked backend)
 ///
 /// # Returns
 ///
@@ -148,14 +154,16 @@ pub fn search(
     limit: usize,
     category: Option<String>,
     case_sensitive: bool,
+    backend: Backend,
+    fuzzy: Option<u8>,
 ) -> anyhow::Result<Vec<SearchResult>> {
     let config = Config::load()?;
-    let backend = RipgrepBackend::new();
 
     let options = SearchOptions {
         limit: Some(limit),
         category,
         case_sensitive,
+        fuzzy,
     };
 
     let mut all_results = Vec::new();
@@ -169,10 +177,13 @@ pub fn search(
         }
 
         match Corpus::load(&path) {
-            Ok(corpus) => match backend.search(query, &corpus, &options) {
-                Ok(results) => all_results.extend(results),
-                Err(e) => errors.push(format!("Search in {}: {e}", path.display())),
-            },
+            Ok(corpus) => {
+                let results = search_corpus(query, &corpus, &options, backend);
+                match results {
+                    Ok(results) => all_results.extend(results),
+                    Err(e) => errors.push(format!("Search in {}: {e}", path.display())),
+                }
+            }
             Err(e) => errors.push(format!("Load {}: {e}", path.display())),
         }
     }
@@ -182,8 +193,101 @@ pub fn search(
         anyhow::bail!("Search failed:\n  {}", errors.join("\n  "));
     }
 
+    // Sort by score if available (ranked backend), otherwise keep order
+    all_results.sort_by(|a, b| match (b.score, a.score) {
+        (Some(b_score), Some(a_score)) => b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        _ => std::cmp::Ordering::Equal,
+    });
+
     all_results.truncate(limit);
     Ok(all_results)
+}
+
+/// Search a single corpus using the specified backend.
+fn search_corpus(
+    query: &str,
+    corpus: &Corpus,
+    options: &SearchOptions,
+    backend: Backend,
+) -> anyhow::Result<Vec<SearchResult>> {
+    match backend {
+        Backend::Ripgrep => {
+            let rg = RipgrepBackend::new();
+            rg.search(query, corpus, options)
+        }
+        #[cfg(feature = "ranked")]
+        Backend::Ranked => {
+            if !TantivyBackend::index_exists(corpus) {
+                anyhow::bail!(
+                    "No index found for corpus at {}. Run `kvault index` first.",
+                    corpus.root.display()
+                );
+            }
+            let tantivy = TantivyBackend::open_for_corpus(corpus, IndexMode::ReadOnly)?;
+            tantivy.search(query, corpus, options)
+        }
+        Backend::Auto => {
+            // Auto-select: use Tantivy if index exists, otherwise ripgrep
+            #[cfg(feature = "ranked")]
+            if TantivyBackend::index_exists(corpus) {
+                let tantivy = TantivyBackend::open_for_corpus(corpus, IndexMode::ReadOnly)?;
+                return tantivy.search(query, corpus, options);
+            }
+
+            let rg = RipgrepBackend::new();
+            rg.search(query, corpus, options)
+        }
+    }
+}
+
+/// Build or rebuild the search index for all configured corpora.
+///
+/// # Returns
+///
+/// The number of corpora successfully indexed.
+///
+/// # Errors
+///
+/// Returns an error if config loading fails or all index operations fail.
+#[cfg(feature = "ranked")]
+pub fn index_all() -> anyhow::Result<usize> {
+    let config = Config::load()?;
+    let mut indexed_count = 0;
+    let mut errors = Vec::new();
+
+    for path_str in &config.corpus.paths {
+        let path = expand_tilde(path_str);
+
+        if !path.exists() {
+            continue;
+        }
+
+        match Corpus::load(&path) {
+            Ok(corpus) => match TantivyBackend::open_for_corpus(&corpus, IndexMode::ReadWrite) {
+                Ok(backend) => match backend.index(&corpus) {
+                    Ok(()) => {
+                        println!("Indexed: {}", path.display());
+                        indexed_count += 1;
+                    }
+                    Err(e) => errors.push(format!("Index {}: {e}", path.display())),
+                },
+                Err(e) => errors.push(format!("Open index {}: {e}", path.display())),
+            },
+            Err(e) => errors.push(format!("Load {}: {e}", path.display())),
+        }
+    }
+
+    if indexed_count == 0 && !errors.is_empty() {
+        anyhow::bail!("Indexing failed:\n  {}", errors.join("\n  "));
+    }
+
+    if !errors.is_empty() {
+        eprintln!("Warnings:\n  {}", errors.join("\n  "));
+    }
+
+    Ok(indexed_count)
 }
 
 /// List documents from all configured corpora.

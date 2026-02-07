@@ -4,14 +4,14 @@ Searchable knowledge corpus with BM25 ranking. Rust library, CLI, and MCP server
 
 ## Status
 
-CLI, search, and MCP server are functional. Tantivy (BM25) search backend planned.
+CLI, search, and MCP server are functional. Optional Tantivy (BM25) ranked search backend available via `ranked` feature.
 
 ## What is kvault?
 
 kvault is a fast, local-first knowledge base that lets you:
 
 - **Store** knowledge as Markdown, JSON, or plain text
-- **Search** with ripgrep (fast) or BM25 ranking (coming soon)
+- **Search** with ripgrep (fast) or Tantivy BM25 ranking (optional)
 - **Access** via CLI, Rust library, or MCP server
 
 No external AI services. No embeddings APIs. You control where your knowledge lives.
@@ -41,6 +41,12 @@ cargo build --release
 
 # With MCP server support
 cargo build --release --features mcp
+
+# With ranked search (BM25 + fuzzy matching)
+cargo build --release --features ranked
+
+# Full build with all features
+cargo build --release --features "ranked,mcp"
 ```
 
 ## Quick Start
@@ -78,9 +84,13 @@ kvault search <query>          # Search the corpus (case-insensitive)
 kvault search <query> -l 5     # Limit results
 kvault search <query> -c aws   # Filter by category
 kvault search <query> -s       # Case-sensitive search
+kvault search <query> -b ranked # Use BM25 ranked search (requires --features ranked)
+kvault search <query> --fuzzy  # Fuzzy search with edit distance 1 (ranked backend)
+kvault search <query> --fuzzy 2 # Fuzzy search with edit distance 2
 kvault list                    # List all documents
 kvault list --category aws     # Filter by category
 kvault get <path>              # Print document contents
+kvault index                   # Build search index (requires --features ranked)
 kvault serve                   # Start MCP server (requires --features mcp)
 ```
 
@@ -116,8 +126,43 @@ Default: `~/.kvault` is used if no config file exists.
 
 | Backend | Use Case | Status |
 |---------|----------|--------|
-| ripgrep | Fast text search, no indexing needed | Available |
-| Tantivy | BM25 ranked results, requires indexing | Planned |
+| ripgrep | Fast text search, no indexing needed | Available (default) |
+| Tantivy | BM25 ranked results, fuzzy search, requires indexing | Available (`ranked` feature) |
+
+### Ranked Search (Tantivy)
+
+Build with ranked search support:
+
+```bash
+cargo build --release --features ranked
+```
+
+Build the search index (required before using ranked search):
+
+```bash
+kvault index
+```
+
+Use ranked search:
+
+```bash
+# Explicit ranked backend
+kvault search "lambda patterns" --backend ranked
+
+# Auto-select (uses ranked if index exists, else ripgrep)
+kvault search "lambda patterns" --backend auto
+
+# Fuzzy search - finds "lambda" even if you type "lamda"
+kvault search "lamda" --fuzzy        # 1 edit distance (default)
+kvault search "lamda" --fuzzy 2      # 2 edit distance (more permissive)
+```
+
+**Edit distance guide:**
+
+| Distance | Catches | Example |
+|----------|---------|---------|
+| 1 | Single typo, missing/extra char | `lamda` matches `lambda` |
+| 2 | Two typos, transpositions | `lambada` matches `lambda` |
 
 ## MCP Server
 
@@ -160,8 +205,8 @@ Add to your editor's MCP configuration:
 
 | Flag | Description |
 |------|-------------|
+| `ranked` | Enable Tantivy BM25 ranked search with fuzzy matching |
 | `mcp` | Enable MCP server (`kvault serve`) |
-| `tantivy` | Enable Tantivy BM25 search backend (planned) |
 
 ## License
 

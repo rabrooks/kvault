@@ -13,8 +13,18 @@ fn main() -> anyhow::Result<()> {
             limit,
             category,
             case_sensitive,
+            backend,
+            fuzzy,
         }) => {
-            let results = commands::search(&query, limit, category, case_sensitive)?;
+            // Validate fuzzy parameter
+            if let Some(distance) = fuzzy
+                && distance > 2
+            {
+                anyhow::bail!("Fuzzy edit distance must be 0-2, got {distance}");
+            }
+
+            let results =
+                commands::search(&query, limit, category, case_sensitive, backend, fuzzy)?;
 
             if results.is_empty() {
                 println!("No matches found for '{query}'");
@@ -22,8 +32,12 @@ fn main() -> anyhow::Result<()> {
             }
 
             for result in &results {
+                let score_str = result
+                    .score
+                    .map(|s| format!(" (score: {s:.2})"))
+                    .unwrap_or_default();
                 println!(
-                    "{}: {} (line {})",
+                    "{}: {} (line {}){score_str}",
                     result.title,
                     result.path.display(),
                     result.line_number
@@ -86,6 +100,13 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Get { path }) => {
             let content = commands::get(&path)?;
             print!("{content}");
+            Ok(())
+        }
+        #[cfg(feature = "ranked")]
+        Some(Commands::Index) => {
+            println!("Building search index...");
+            let count = commands::index_all()?;
+            println!("\nIndexed {count} corpus(es)");
             Ok(())
         }
         #[cfg(feature = "mcp")]

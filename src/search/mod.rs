@@ -2,6 +2,9 @@
 
 pub mod ripgrep;
 
+#[cfg(feature = "ranked")]
+pub mod tantivy;
+
 use std::path::PathBuf;
 
 use crate::corpus::Corpus;
@@ -15,6 +18,9 @@ pub struct SearchOptions {
     pub category: Option<String>,
     /// Use case-sensitive matching (default is case-insensitive).
     pub case_sensitive: bool,
+    /// Fuzzy search edit distance (0-2). None means exact matching.
+    /// Only used by backends that support fuzzy search (e.g., Tantivy).
+    pub fuzzy: Option<u8>,
 }
 
 /// A single search result with match context.

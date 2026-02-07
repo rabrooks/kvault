@@ -22,8 +22,8 @@ toml = "0.9.11"
 
 [features]
 default = []
-tantivy = ["dep:tantivy"]
-mcp = ["dep:rmcp", "dep:tokio"]
+ranked = ["dep:tantivy"]  # BM25 relevance ranking, fuzzy search
+mcp = ["dep:rmcp", "dep:tokio"]  # MCP server for AI editors
 
 [dev-dependencies]
 assert_cmd = "2.0"
