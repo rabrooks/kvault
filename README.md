@@ -14,8 +14,8 @@ milestone by milestone:
 | Milestone | Delivers | State |
 |---|---|---|
 | M0 | toolchain pin, module tree, schema v1, `status`, CI | done |
-| M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | next |
-| M2 | `search`, `get`, `--explain`, `bench` | |
+| M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | done |
+| M2 | `search`, `get`, `--explain`, `bench` | next |
 | M3 | `recall` budget packer, `brief` | |
 | M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | |
 | M5 | links stream, `links` | |
@@ -70,7 +70,23 @@ budget = 2000
 recent_days = 14
 ```
 
-`kvault init` writes this for you once M1 lands.
+`kvault init` writes this for you (only roots that exist on disk) and runs the first index.
+
+## Indexing
+
+`kvault index` is incremental: files whose mtime and size match are skipped without being
+read; changed files are hashed with BLAKE3 and re-parsed only if the hash differs. A file that
+moves keeps its document id. Deleted files are soft-deleted so a restored file reclaims its id.
+A root that is missing on disk is skipped, never treated as a mass delete. Git ignore files are
+not honoured inside roots (they are often inside ignored directories); a `.kvaultignore` is.
+
+Documents are chunked by heading. Sections over 1,200 tokens split at the best blank line or
+rule, never inside a code fence; sections under 40 tokens merge into the next one. Frontmatter is
+optional: `title`, `description`, `kind`/`type`, `tags`, `created`, `updated`, `pinned` are
+lifted, everything else is kept as filterable metadata. `[[wikilinks]]`, relative `.md` links,
+`- verb [[Target]]` relations, and `- [category] text #tag` observation lines are extracted.
+
+On a corpus of 226 files / 1.3 MB: cold index ~200 ms, warm ~4 ms.
 
 ## CLI (v0 surface)
 

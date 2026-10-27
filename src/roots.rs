@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use directories::BaseDirs;
+
 use crate::config::{ProjectFrom, RootConfig, expand_tilde};
 
 /// What kind of knowledge a root holds. Drives ranking authority and defaults.
@@ -105,21 +107,39 @@ pub fn derive_project(dir: &Path, from: ProjectFrom) -> Option<String> {
     }
 }
 
-/// `-Users-abrooks-Projects-work-mas` → `work-mas`.
-///
-/// Claude Code's slug is the absolute path with `/` replaced by `-`, so the
-/// project name is whatever follows the last path segment we can recognise
-/// as a projects container. Without that knowledge we take the tail after
-/// `-Projects-` when present, else the whole slug minus its leading dash.
+/// Claude Code's memory slug is the absolute path with `/` replaced by `-`.
+/// Map it to a project name relative to the home directory:
+/// `-Users-abrooks-Projects-work-mas` → `work-mas`,
+/// `-Users-abrooks-dotfiles-nvim` → `dotfiles-nvim`,
+/// `-Users-abrooks` (the home dir itself) → `None`.
 #[must_use]
 pub fn claude_slug_project(slug: &str) -> Option<String> {
-    let s = slug.strip_prefix('-').unwrap_or(slug);
-    let tail = s.rsplit_once("-Projects-").map_or(s, |(_, tail)| tail);
-    if tail.is_empty() {
+    let home_slug = BaseDirs::new().map(|b| path_slug(b.home_dir()));
+    claude_slug_project_with_home(slug, home_slug.as_deref())
+}
+
+fn claude_slug_project_with_home(slug: &str, home_slug: Option<&str>) -> Option<String> {
+    let s = match home_slug.and_then(|h| slug.strip_prefix(h)) {
+        Some(rest) => rest,
+        // Not under this home (another user, a test fixture): fall back to the
+        // tail after the last `-Projects-`, else the whole slug.
+        None => slug
+            .rsplit_once("-Projects-")
+            .map_or(slug, |(_, tail)| tail),
+    };
+    let s = s.strip_prefix('-').unwrap_or(s);
+    // Inside `~/Projects/<name>` the project is `<name>`; elsewhere keep the path tail.
+    let s = s.strip_prefix("Projects-").unwrap_or(s);
+    if s.is_empty() {
         None
     } else {
-        Some(tail.to_owned())
+        Some(s.to_owned())
     }
+}
+
+/// `/Users/abrooks` → `-Users-abrooks` (Claude Code's directory slug).
+fn path_slug(path: &Path) -> String {
+    path.to_string_lossy().replace(['/', '\\'], "-")
 }
 
 #[cfg(test)]

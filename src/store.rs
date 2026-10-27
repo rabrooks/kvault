@@ -192,6 +192,10 @@ impl Store {
         &self.conn
     }
 
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path

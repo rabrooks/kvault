@@ -77,16 +77,22 @@ pub enum Command {
         #[arg(long)]
         expected_hash: Option<String>,
     },
-    /// List indexed documents
+    /// List indexed documents, newest first
     List {
         #[arg(long)]
         root: Option<String>,
+        /// Root kind (memory, notes, reference) or frontmatter kind
         #[arg(long)]
         kind: Option<String>,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
+        project: Option<String>,
+        /// Only documents updated in the last N days
+        #[arg(long)]
         recent: Option<u32>,
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
     },
     /// Show link neighbours of a document
     Links {
