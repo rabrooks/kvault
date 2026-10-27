@@ -1,212 +1,91 @@
 # kvault
 
-Searchable knowledge corpus with BM25 ranking. Rust library, CLI, and MCP server.
+Local-first knowledge index for coding agents. Markdown files on disk are the only source of
+truth; kvault derives a disposable SQLite index (FTS5 over heading-level chunks, links, tags)
+and gives agents token-budgeted retrieval through a CLI, Claude Code hooks, and an optional
+MCP adapter.
 
 ## Status
 
-CLI, search, and MCP server are functional. Optional Tantivy (BM25) ranked search backend available via `ranked` feature.
+**v0 rebuild in progress** on the `rebuild/v0` branch. The 0.1 manifest/ripgrep/Tantivy code
+was removed; it never saw real use. The skeleton builds, the schema is live, and commands land
+milestone by milestone:
 
-## What is kvault?
+| Milestone | Delivers | State |
+|---|---|---|
+| M0 | toolchain pin, module tree, schema v1, `status`, CI | done |
+| M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | next |
+| M2 | `search`, `get`, `--explain`, `bench` | |
+| M3 | `recall` budget packer, `brief` | |
+| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | |
+| M5 | links stream, `links` | |
+| M6 | MCP stdio adapter (`--features mcp`) | |
 
-kvault is a fast, local-first knowledge base that lets you:
+Commands that are not implemented yet exit with code 3 and name their milestone.
 
-- **Store** knowledge as Markdown, JSON, or plain text
-- **Search** with ripgrep (fast) or Tantivy BM25 ranking (optional)
-- **Access** via CLI, Rust library, or MCP server
+## Why
 
-No external AI services. No embeddings APIs. You control where your knowledge lives.
+Knowledge for agent work ends up in several places at once: Claude Code auto-memory dirs,
+per-project `notes/` folders, reference notes, `CLAUDE.md`. Nothing searches across them, and
+the agent only sees what fits in a session-start file. kvault indexes those directories
+*in place*, never moves or rewrites a file, and answers "what did we decide about X" in one
+command sized to a token budget.
 
-## Installation
+Design principles: markdown is the only truth; index what exists (frontmatter optional);
+budgets are tokens, not counts; hooks are fast and silent; no LLM and no daemon in the loop;
+ranking is explainable; the core stays small.
 
-Requires [ripgrep](https://github.com/BurntSushi/ripgrep) for search:
+## Build
+
+Requires Rust 1.95 (pinned in `rust-toolchain.toml`; `rustup` picks it up).
 
 ```bash
-brew install ripgrep    # macOS
-cargo install ripgrep   # any platform
-apt install ripgrep     # Debian/Ubuntu
-```
-
-Install kvault:
-
-```bash
-cargo install kvault
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/aaronbrooks/kvault
-cd kvault
 cargo build --release
-
-# With MCP server support
-cargo build --release --features mcp
-
-# With ranked search (BM25 + fuzzy matching)
-cargo build --release --features ranked
-
-# Full build with all features
-cargo build --release --features "ranked,mcp"
-```
-
-## Quick Start
-
-Add a document:
-
-```bash
-echo "# Lambda Patterns
-
-Use environment variables for configuration.
-Keep functions small and focused.
-" | kvault add --title "AWS Lambda Patterns" --category aws --tags "lambda,serverless"
-```
-
-Or from a file:
-
-```bash
-kvault add --title "AWS Lambda Patterns" --category aws --file ./notes.md
-```
-
-Then search and retrieve:
-
-```bash
-kvault list                           # List all documents
-kvault search "environment"           # Search content
-kvault get aws/aws-lambda-patterns.md # View full document
-```
-
-## CLI Commands
-
-```
-kvault add --title "..." --category "..." [--tags "..."] [--file path]
-                               # Add document (reads stdin if no --file)
-kvault search <query>          # Search the corpus (case-insensitive)
-kvault search <query> -l 5     # Limit results
-kvault search <query> -c aws   # Filter by category
-kvault search <query> -s       # Case-sensitive search
-kvault search <query> -b ranked # Use BM25 ranked search (requires --features ranked)
-kvault search <query> --fuzzy  # Fuzzy search with edit distance 1 (ranked backend)
-kvault search <query> --fuzzy 2 # Fuzzy search with edit distance 2
-kvault list                    # List all documents
-kvault list --category aws     # Filter by category
-kvault get <path>              # Print document contents
-kvault index                   # Build search index (requires --features ranked)
-kvault serve                   # Start MCP server (requires --features mcp)
+cargo test
 ```
 
 ## Configuration
 
-Config file: `~/.config/kvault/config.toml`
+`~/.config/kvault/config.toml` (override with `KVAULT_CONFIG`; index path with `KVAULT_DB`):
 
 ```toml
-[corpus]
-paths = [
-  "~/.kvault",              # default location
-  "./.kvault",              # add project-specific paths as needed
-  "~/work/shared-kb",       # or team/custom locations
-]
+[[roots]]
+path = "~/.claude/projects/*/memory"   # globs allowed
+kind = "memory"
+weight = 1.2
+project_from = "claude_slug"
+
+[[roots]]
+path = "~/Projects/*/notes"
+kind = "notes"
+project_from = "parent"
+
+[[roots]]
+path = "~/Projects/notes"
+kind = "reference"
+weight = 0.8
+
+[brief]
+budget = 2000
+recent_days = 14
 ```
 
-Default: `~/.kvault` is used if no config file exists.
+`kvault init` writes this for you once M1 lands.
 
-### Environment Variables
+## CLI (v0 surface)
 
-| Variable | Description |
-|----------|-------------|
-| `KVAULT_CONFIG` | Override config file location (useful for testing) |
-
-## Storage Backends
-
-| Backend | Use Case | Status |
-|---------|----------|--------|
-| Local filesystem | CLI users, scripts, personal knowledge | Available |
-| S3 | Team sharing, distributed corpus | Planned |
-
-## Search Backends
-
-| Backend | Use Case | Status |
-|---------|----------|--------|
-| ripgrep | Fast text search, no indexing needed | Available (default) |
-| Tantivy | BM25 ranked results, fuzzy search, requires indexing | Available (`ranked` feature) |
-
-### Ranked Search (Tantivy)
-
-Build with ranked search support:
-
-```bash
-cargo build --release --features ranked
 ```
-
-Build the search index (required before using ranked search):
-
-```bash
-kvault index
+kvault init                                  write config, index
+kvault index [--full] [--root P]             incremental reindex
+kvault search <q> [--project P] [--tag T] [--path G] [--since 30d] [--explain]
+kvault recall <q> --budget N [--project P]   search packed to a token budget (agents call this)
+kvault get <id|path>[:from[:count]]          print a chunk or line window
+kvault brief [--cwd P] [--budget N]          what the SessionStart hook injects
+kvault add --title T [--kind K] [--tags a,b] write a note and index it
+kvault list / links / status / bench
+kvault hook session-start|stop|pre-compact   Claude Code hook entry points
+kvault serve                                 MCP stdio (feature `mcp`)
 ```
-
-Use ranked search:
-
-```bash
-# Explicit ranked backend
-kvault search "lambda patterns" --backend ranked
-
-# Auto-select (uses ranked if index exists, else ripgrep)
-kvault search "lambda patterns" --backend auto
-
-# Fuzzy search - finds "lambda" even if you type "lamda"
-kvault search "lamda" --fuzzy        # 1 edit distance (default)
-kvault search "lamda" --fuzzy 2      # 2 edit distance (more permissive)
-```
-
-**Edit distance guide:**
-
-| Distance | Catches | Example |
-|----------|---------|---------|
-| 1 | Single typo, missing/extra char | `lamda` matches `lambda` |
-| 2 | Two typos, transpositions | `lambada` matches `lambda` |
-
-## MCP Server
-
-kvault includes an MCP server for AI editor integration. Build with MCP support:
-
-```bash
-cargo build --release --features mcp
-```
-
-Add to your editor's MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "kvault": {
-      "command": "kvault",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-### Supported Editors
-
-- Claude Code
-- Cursor
-- Windsurf
-- Any editor supporting the Model Context Protocol
-
-### MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `search_knowledge` | Search the corpus for matching documents |
-| `list_knowledge` | List all documents, optionally filtered by category |
-| `get_document` | Get full contents of a document by path |
-| `add_knowledge` | Add a new document to the corpus |
-
-## Feature Flags
-
-| Flag | Description |
-|------|-------------|
-| `ranked` | Enable Tantivy BM25 ranked search with fuzzy matching |
-| `mcp` | Enable MCP server (`kvault serve`) |
 
 ## License
 

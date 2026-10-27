@@ -1,119 +1,106 @@
-use std::io::Read;
+use std::process::ExitCode;
 
 use clap::Parser;
-use kvault::cli::{Cli, Commands};
-use kvault::commands;
 
-fn main() -> anyhow::Result<()> {
+use kvault::cli::{Cli, Command};
+use kvault::config::Config;
+use kvault::error::{Error, Milestone};
+use kvault::roots;
+use kvault::store::Store;
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    match cli.command {
-        Some(Commands::Search {
-            query,
-            limit,
-            category,
-            case_sensitive,
-            backend,
-            fuzzy,
-        }) => {
-            // Validate fuzzy parameter
-            if let Some(distance) = fuzzy
-                && distance > 2
-            {
-                anyhow::bail!("Fuzzy edit distance must be 0-2, got {distance}");
-            }
-
-            let results =
-                commands::search(&query, limit, category, case_sensitive, backend, fuzzy)?;
-
-            if results.is_empty() {
-                println!("No matches found for '{query}'");
-                return Ok(());
-            }
-
-            for result in &results {
-                let score_str = result
-                    .score
-                    .map(|s| format!(" (score: {s:.2})"))
-                    .unwrap_or_default();
-                println!(
-                    "{}: {} (line {}){score_str}",
-                    result.title,
-                    result.path.display(),
-                    result.line_number
-                );
-                println!("  {}", result.matched_line);
-            }
-
-            println!("\n{} result(s) found", results.len());
-            Ok(())
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e @ Error::NotImplemented { .. }) => {
+            // Distinct code so scripts can tell "not yet" from "failed".
+            eprintln!("{e}");
+            ExitCode::from(3)
         }
-        Some(Commands::List { category }) => {
-            let documents = commands::list(category.as_deref())?;
-
-            if documents.is_empty() {
-                println!("No documents found.");
-                return Ok(());
-            }
-
-            for doc in &documents {
-                let tags = if doc.tags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", doc.tags.join(", "))
-                };
-                println!("{}: {}{tags}", doc.category, doc.title);
-                println!("  {}", doc.path.display());
-            }
-
-            Ok(())
-        }
-        Some(Commands::Add {
-            title,
-            category,
-            tags,
-            file,
-        }) => {
-            let content = if let Some(path) = file {
-                std::fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read file {path}: {e}"))?
-            } else {
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
-                buf
-            };
-
-            if content.trim().is_empty() {
-                anyhow::bail!("Content cannot be empty");
-            }
-
-            let tag_list = commands::parse_tags(tags);
-
-            let result = commands::add(&title, &content, &category, tag_list)?;
-
-            println!("Added: {}", result.title);
-            println!("  Category: {}", result.category);
-            println!("  Path: {}", result.path.display());
-
-            Ok(())
-        }
-        Some(Commands::Get { path }) => {
-            let content = commands::get(&path)?;
-            print!("{content}");
-            Ok(())
-        }
-        #[cfg(feature = "ranked")]
-        Some(Commands::Index) => {
-            println!("Building search index...");
-            let count = commands::index_all()?;
-            println!("\nIndexed {count} corpus(es)");
-            Ok(())
-        }
-        #[cfg(feature = "mcp")]
-        Some(Commands::Serve) => tokio::runtime::Runtime::new()?.block_on(kvault::mcp::serve()),
-        None => {
-            Cli::parse_from(["kvault", "--help"]);
-            Ok(())
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
         }
     }
+}
+
+fn run(command: Command) -> kvault::Result<()> {
+    match command {
+        Command::Status => status(),
+        Command::Index { full, quiet, .. } => {
+            kvault::index::run(kvault::index::IndexOptions { full, quiet })
+        }
+        Command::Search(args) => kvault::search::run(&args.query).map(|_| ()),
+        Command::Init { .. } => not_yet("init", Milestone::M1Index),
+        Command::List { .. } => not_yet("list", Milestone::M1Index),
+        Command::Get { .. } => not_yet("get", Milestone::M2Search),
+        Command::Recall { .. } => not_yet("recall", Milestone::M3Recall),
+        Command::Brief { .. } => not_yet("brief", Milestone::M3Recall),
+        Command::Add { .. } => not_yet("add", Milestone::M4Hooks),
+        Command::Hook { .. } => not_yet("hook", Milestone::M4Hooks),
+        Command::Links { .. } => not_yet("links", Milestone::M5Graph),
+        Command::Bench { .. } => not_yet("bench", Milestone::M2Search),
+        #[cfg(feature = "mcp")]
+        Command::Serve => not_yet("serve", Milestone::M6Mcp),
+    }
+}
+
+fn not_yet(command: &'static str, milestone: Milestone) -> kvault::Result<()> {
+    Err(Error::NotImplemented { command, milestone })
+}
+
+fn status() -> kvault::Result<()> {
+    let config = Config::load()?;
+    let config_path = Config::config_path();
+    let db_path = Config::db_path();
+
+    println!(
+        "config:  {}{}",
+        config_path
+            .as_deref()
+            .map_or("<none>".into(), |p| p.display().to_string()),
+        if config_path.as_deref().is_some_and(std::path::Path::exists) {
+            ""
+        } else {
+            "  (not found, using defaults)"
+        }
+    );
+
+    let expanded = roots::expand(&config.roots);
+    println!(
+        "roots:   {} configured, {} present",
+        config.roots.len(),
+        expanded.len()
+    );
+    for r in &expanded {
+        println!(
+            "  {:<9} {:<4.1} {:<12} {}",
+            r.kind.as_str(),
+            r.weight,
+            r.project.as_deref().unwrap_or("-"),
+            r.path.display()
+        );
+    }
+    if config.roots.is_empty() {
+        println!("  (none configured; run `kvault init`)");
+    }
+
+    match db_path {
+        Some(p) if p.exists() => {
+            let store = Store::open(&p)?;
+            let c = store.counts()?;
+            let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+            println!("index:   {} ({} KB)", p.display(), size / 1024);
+            println!(
+                "         {} roots, {} docs, {} chunks, {} links, {} tags",
+                c.roots, c.docs, c.chunks, c.links, c.tags
+            );
+            if let Some(t) = store.meta("last_index_at")? {
+                println!("         last indexed {t}");
+            }
+        }
+        Some(p) => println!("index:   {} (not built; run `kvault index`)", p.display()),
+        None => println!("index:   <no data dir available>"),
+    }
+    Ok(())
 }

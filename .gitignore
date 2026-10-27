@@ -1,27 +1,15 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
-# IDE
+# IDE / OS
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
 
-# kvault index files
-.index/
-
-# Environment
+# Local scratch (project notes live in notes/, git-excluded via .git/info/exclude)
 .env
 .env.local
-
-
-# Added by cargo
-
-/target
