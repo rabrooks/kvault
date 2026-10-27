@@ -1,6 +1,5 @@
 //! Search: query parsing, retrieval streams, reciprocal rank fusion, explain.
-//!
-//! Implemented in M2.
+//! Not implemented yet.
 
 use crate::error::{Error, Milestone, Result};
 

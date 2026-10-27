@@ -7,19 +7,19 @@
 //!
 //! # Module map
 //!
-//! | Module | Role | Milestone |
-//! |---|---|---|
-//! | [`config`] | `config.toml` loading, root declarations | M0 |
-//! | [`roots`] | root kinds, glob expansion, project detection | M0/M1 |
-//! | [`store`] | `SQLite` schema, migrations, connection | M0/M1 |
-//! | [`markdown`] | frontmatter, heading chunker, link extraction | M1 |
-//! | [`index`] | walk roots, hash, upsert docs/chunks | M1 |
-//! | [`list`] | document listing with filters | M1 |
-//! | [`search`] | query parser, streams, rank fusion, explain | M2 |
-//! | [`pack`] | token-budget packer for `recall` and `brief` | M3 |
-//! | [`capture`] | session-note writer used by Stop/`PreCompact` hooks | M4 |
-//! | [`hooks`] | Claude Code hook entry points | M4 |
-//! | [`cli`] | clap command definitions | M0 |
+//! | Module | Role |
+//! |---|---|
+//! | [`config`] | `config.toml` loading, root declarations |
+//! | [`roots`] | root kinds, glob expansion, project detection |
+//! | [`store`] | `SQLite` schema, migrations, connection |
+//! | [`markdown`] | frontmatter, heading chunker, link extraction |
+//! | [`index`] | walk roots, hash, upsert docs/chunks |
+//! | [`list`] | document listing with filters |
+//! | [`search`] | query parser, streams, rank fusion, explain |
+//! | [`pack`] | token-budget packer for `recall` and `brief` |
+//! | [`capture`] | session-note writer used by Stop/`PreCompact` hooks |
+//! | [`hooks`] | Claude Code hook entry points |
+//! | [`cli`] | clap command definitions |
 
 pub mod capture;
 pub mod cli;

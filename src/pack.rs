@@ -1,7 +1,5 @@
-//! Budget packer: fit ranked hits into a token budget using L0/L1/L2 tiers
-//! and a measure-and-drop loop. Whole chunk or nothing.
-//!
-//! Implemented in M3.
+//! Budget packer: fit ranked hits into a token budget using tiered detail
+//! levels and a measure-and-drop loop. A chunk is included whole or not at all.
 
 /// Token counting is behind a trait so the BPE-backed counter can be swapped
 /// for a byte heuristic when the tables are unavailable.

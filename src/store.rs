@@ -11,7 +11,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use crate::error::{Error, Result};
 
 /// Current schema version. Bump with every DDL change.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Minimum `SQLite` version: `FTS5` `contentless_delete` arrived in 3.43.0.
 pub const MIN_SQLITE_VERSION: i32 = 3_043_000;
@@ -61,8 +61,6 @@ CREATE TABLE chunks (
 );
 CREATE INDEX chunks_blake3 ON chunks(blake3);
 
--- Contentless FTS: bodies live only in the files and inside this index.
--- rowid is chunks.id so hits map straight back to a byte range.
 CREATE VIRTUAL TABLE chunks_fts USING fts5(
     title, heading_path, body, path,
     content='', contentless_delete=1,
@@ -100,6 +98,22 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"#;
+
+/// v2: the v1 tokenizer kept `/ _ - .` inside tokens, so `cold-start` and
+/// `simpler.` never matched a plain-word query. Paths stay findable as phrase
+/// queries (`path:"aws/lambda.md"` matches the token sequence aws, lambda, md).
+/// Rebuilding the contentless FTS table empties it, so every root is marked
+/// for re-parse via the new per-root `parser_version` column.
+const MIGRATE_V2: &str = r#"
+DROP TABLE chunks_fts;
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    title, heading_path, body, path,
+    content='', contentless_delete=1,
+    tokenize="unicode61 remove_diacritics 2",
+    prefix='2 3'
+);
+ALTER TABLE roots ADD COLUMN parser_version TEXT;
 "#;
 
 /// An open index database.
@@ -160,6 +174,9 @@ impl Store {
         self.migrate()
     }
 
+    /// Apply pending migrations inside one `IMMEDIATE` transaction so two
+    /// processes opening a fresh database serialise, and a crash mid-DDL
+    /// rolls back instead of leaving a partial schema.
     fn migrate(&self) -> Result<()> {
         let current: i64 = self
             .conn
@@ -167,6 +184,20 @@ impl Store {
         if current == SCHEMA_VERSION {
             return Ok(());
         }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.migrate_locked();
+        if result.is_ok() {
+            self.conn.execute_batch("COMMIT")?;
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    fn migrate_locked(&self) -> Result<()> {
+        let mut current: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if current > SCHEMA_VERSION {
             return Err(Error::Other(anyhow::anyhow!(
                 "index schema v{current} is newer than this kvault (v{SCHEMA_VERSION}); \
@@ -176,14 +207,20 @@ impl Store {
         }
         if current == 0 {
             self.conn.execute_batch(SCHEMA_V1)?;
-            self.conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-                params![SCHEMA_VERSION.to_string()],
-            )?;
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            current = 1;
         }
-        // Future: `if current < 2 { ... }` steps, applied in order.
+        if current == 1 {
+            self.conn.execute_batch(MIGRATE_V2)?;
+            current = 2;
+        }
+        debug_assert_eq!(current, SCHEMA_VERSION);
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -259,14 +296,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_schema_v1() {
+    fn fresh_db_has_current_schema() {
         let s = Store::open_in_memory().unwrap();
         let v: i64 = s
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("1"));
+        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("2"));
         let tables: Vec<String> = s
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table') ORDER BY name")
@@ -332,6 +369,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn punctuation_does_not_glue_words_together() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO chunks_fts(rowid, title, heading_path, body, path)
+                 VALUES (1, 't', '', 'It is simpler. Use cold-start tuning and snake_case names.', 'p.md')",
+                [],
+            )
+            .unwrap();
+        for term in ["simpler", "cold", "start", "snake", "case"] {
+            let n: i64 = s
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH '{term}'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{term} should match");
+        }
+    }
+
+    #[test]
+    fn v1_database_migrates_to_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute("INSERT INTO roots(path, kind) VALUES ('/r', 'notes')", [])
+                .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let v: i64 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let pv: Option<String> = s
+            .conn()
+            .query_row(
+                "SELECT parser_version FROM roots WHERE path = '/r'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pv, None, "migrated roots are marked for re-parse");
     }
 
     #[test]

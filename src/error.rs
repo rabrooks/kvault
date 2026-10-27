@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-/// Milestone labels used in "not implemented" errors so the user knows where
-/// a command lands on the roadmap.
+/// Roadmap milestone named in "not implemented" errors; the README lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Milestone {
     M1Index,

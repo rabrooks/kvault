@@ -1,3 +1,2 @@
-//! Session-note writer used by the Stop and `PreCompact` hooks. Zero LLM calls.
-//!
-//! Implemented in M4.
+//! Session-note writer used by the Stop and `PreCompact` hooks. Makes no LLM calls.
+//! Not implemented yet.

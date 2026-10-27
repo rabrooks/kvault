@@ -1,7 +1,6 @@
 //! Markdown parsing: frontmatter, heading-level chunks, links, tags, observations.
 //!
-//! Everything here is pure: `parse` takes the file text and returns byte
-//! ranges into it. Nothing is stored except what the indexer chooses to.
+//! `parse` is pure: it takes the file text and returns byte ranges into it.
 //! Frontmatter is optional; a plain `.md` with no metadata parses fully.
 
 use std::collections::BTreeMap;
@@ -31,8 +30,8 @@ pub struct Frontmatter {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-/// One heading section of a document, addressed by line and byte range.
-/// Byte offsets are into the full file text (frontmatter included).
+/// One heading section of a document. Byte offsets are into the full file
+/// text, frontmatter included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub ordinal: u32,
@@ -61,7 +60,8 @@ pub enum LinkType {
     Wiki,
     /// `[text](relative.md)`
     Markdown,
-    /// `- verb [[Target]]` (basic-memory convention); the verb is stored.
+    /// `- verb [[Target]]`: a typed relation; the verb is stored lower-cased
+    /// with spaces as underscores.
     Relation(String),
 }
 
@@ -300,6 +300,11 @@ fn collect_headings(body: &str, body_start: usize) -> Vec<Heading> {
                     buf.push_str(&t);
                 }
             }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, buf)) = current.as_mut() {
+                    buf.push(' ');
+                }
+            }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((start, level, buf)) = current.take() {
                     out.push(Heading {
@@ -535,9 +540,9 @@ fn merge_tiny(chunks: Vec<Chunk>) -> Vec<Chunk> {
 
 fn collect_links(body: &str, body_start: usize, lines: &LineIndex) -> Vec<Link> {
     let mut out = Vec::new();
-    // Byte ranges (relative to body) that are code: fenced/indented blocks and spans.
-    // Wikilinks inside them are not links. pulldown-cmark splits text at every
-    // bracket, so wikilinks are scanned on the raw body instead of on events.
+    // Wikilinks are scanned on the raw body rather than on parser events, because
+    // pulldown-cmark splits text at every bracket. Code blocks and spans are
+    // collected first so links inside them are ignored.
     let mut code_ranges: Vec<(usize, usize)> = Vec::new();
     for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
         match event {
@@ -567,17 +572,20 @@ fn collect_links(body: &str, body_start: usize, lines: &LineIndex) -> Vec<Link> 
             break;
         };
         let inner = &body[open_abs + 2..open_abs + 2 + close];
-        pos = open_abs + 2 + close + 2;
         if in_code(open_abs) || inner.contains('\n') || inner.contains("[[") {
+            // Not a link; the next `[[` may start one, so resume just past this opener.
+            pos = open_abs + 2;
             continue;
         }
+        pos = open_abs + 2 + close + 2;
         let target = inner.split('|').next().unwrap_or(inner);
         let target = target.split('#').next().unwrap_or(target).trim();
         if target.is_empty() {
             continue;
         }
         let abs = body_start + open_abs;
-        let line_start = lines.line_start(abs);
+        // A line may begin before the body does (BOM, no frontmatter).
+        let line_start = lines.line_start(abs).max(body_start);
         let line_text = body[line_start - body_start..]
             .split('\n')
             .next()
@@ -866,6 +874,30 @@ mod tests {
                 ("../x/y.md", "md".to_owned(), 4),
             ]
         );
+    }
+
+    #[test]
+    fn bom_file_with_wikilink_on_first_line() {
+        let text = "\u{feff}- fixes [[Target]] first line\n";
+        let p = parse(text, "f");
+        assert_eq!(p.links.len(), 1);
+        assert_eq!(p.links[0].link_type, LinkType::Relation("fixes".into()));
+        assert_eq!(p.links[0].line, 1);
+    }
+
+    #[test]
+    fn rejected_candidate_does_not_swallow_next_link() {
+        let text = "`[[code]]` then [[real]] and [[nested [[x]] ]] then [[after]]\n";
+        let p = parse(text, "f");
+        let targets: Vec<_> = p.links.iter().map(|l| l.target.as_str()).collect();
+        assert_eq!(targets, vec!["real", "x", "after"]);
+    }
+
+    #[test]
+    fn multi_line_setext_heading_keeps_word_boundaries() {
+        let text = "First part\nsecond part\n==========\n\nbody text here long enough\n";
+        let heads = collect_headings(text, 0);
+        assert_eq!(heads[0].text, "First part second part");
     }
 
     #[test]

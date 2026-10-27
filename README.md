@@ -7,9 +7,8 @@ MCP adapter.
 
 ## Status
 
-**v0 rebuild in progress** on the `rebuild/v0` branch. The 0.1 manifest/ripgrep/Tantivy code
-was removed; it never saw real use. The skeleton builds, the schema is live, and commands land
-milestone by milestone:
+**v0 rebuild in progress.** The 0.1 manifest/ripgrep/Tantivy code was removed; it never saw
+real use. Commands land milestone by milestone:
 
 | Milestone | Delivers | State |
 |---|---|---|

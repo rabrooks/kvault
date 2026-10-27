@@ -353,7 +353,9 @@ fn modify_rename_delete_and_restore() {
         ),
         1
     );
-    // The incoming `supersedes [[plan]]` link keeps pointing at the same doc id.
+    // Links are re-resolved from scratch every run, so `[[plan]]` no longer
+    // matches: the stem is now `plan-renamed` and the title `Plan v2`. A full
+    // rebuild would give the same answer.
     let to: Option<i64> = fx
         .store
         .conn()
@@ -363,7 +365,7 @@ fn modify_rename_delete_and_restore() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(to, Some(plan_id));
+    assert_eq!(to, None);
 
     // Delete: → removed, soft-deleted, chunks gone, links to it nulled.
     std::fs::remove_file(&renamed).unwrap();
@@ -410,6 +412,20 @@ fn modify_rename_delete_and_restore() {
     assert_eq!(index::doc_active(&fx.store, plan_id).unwrap(), Some(true));
     let docs_total = count(&fx.store, "SELECT COUNT(*) FROM docs");
     assert_eq!(docs_total, 5, "no duplicate row was created");
+    let to: Option<i64> = fx
+        .store
+        .conn()
+        .query_row(
+            "SELECT to_doc_id FROM links WHERE link_type = 'rel:supersedes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        to,
+        Some(plan_id),
+        "back at plan.md the link resolves by path again"
+    );
 }
 
 #[test]
@@ -468,24 +484,213 @@ fn only_root_limits_the_run_and_missing_root_is_not_a_mass_delete() {
 }
 
 #[test]
-fn parser_version_change_forces_reparse() {
+fn rename_onto_a_soft_deleted_path_does_not_violate_uniqueness() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let a = fx.base.join("proj-b/notes/other.md");
+    let b = fx.base.join("proj-b/notes/b.md");
+    write(
+        &b,
+        "# B\n\nA second document in project b with enough text to chunk.\n",
+    );
+    age(&b);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    // Delete a, index (a is soft-deleted), then move b onto a's path.
+    std::fs::remove_file(&a).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.removed, 1);
+    std::fs::rename(&b, &a).unwrap();
+    age(&a);
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.renamed, 1);
+    // Every later run must still work.
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.unchanged, 5);
+    let titles: Vec<String> = fx
+        .store
+        .conn()
+        .prepare("SELECT title FROM docs WHERE rel_path = 'other.md' AND root_id = (SELECT id FROM roots WHERE path LIKE '%proj-b%')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["B".to_owned()],
+        "exactly one row holds the path"
+    );
+}
+
+#[test]
+fn identical_content_files_are_all_soft_deleted() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    let dir = fx.base.join("proj-b/notes");
+    for n in ["dup1.md", "dup2.md", "dup3.md"] {
+        write(
+            &dir.join(n),
+            "# Same\n\nIdentical content in every copy of this note.\n",
+        );
+        age(&dir.join(n));
+    }
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    for n in ["dup1.md", "dup2.md", "dup3.md"] {
+        std::fs::remove_file(dir.join(n)).unwrap();
+    }
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.removed, 3);
+    assert_eq!(
+        count(
+            &fx.store,
+            "SELECT COUNT(*) FROM docs WHERE active = 1 AND rel_path LIKE 'dup%'"
+        ),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_subdirectory_skips_deletions_for_that_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fx = fixture();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let sub = fx.base.join("proj-a/notes/sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default());
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = r.unwrap();
+    assert!(r.errors >= 1);
+    assert_eq!(
+        r.removed, 0,
+        "files under the unreadable dir must not be soft-deleted"
+    );
+    assert_eq!(
+        index::doc_active(&fx.store, doc_id(&fx.store, "sub/arch.md")).unwrap(),
+        Some(true)
+    );
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.errors, 0);
+    assert_eq!(r.removed, 0);
+}
+
+fn doc_id(store: &Store, rel_path: &str) -> i64 {
+    store
+        .conn()
+        .query_row("SELECT id FROM docs WHERE rel_path = ?1", [rel_path], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn only_root_with_no_match_is_an_error() {
+    let mut fx = fixture();
+    let opts = IndexOptions {
+        only_root: Some(fx.base.join("nope")),
+        ..Default::default()
+    };
+    let err = index::run(&fx.config, &mut fx.store, &opts).unwrap_err();
+    assert!(err.to_string().contains("not a configured root"), "{err}");
+    assert!(fx.store.meta("last_index_at").unwrap().is_none());
+}
+
+#[test]
+fn parser_version_is_tracked_per_root() {
     let mut fx = fixture();
     age_all(&fx.base);
     index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
     fx.store
         .conn()
-        .execute(
-            "UPDATE meta SET value = '0' WHERE key = 'parser_version'",
-            [],
-        )
+        .execute("UPDATE roots SET parser_version = '0'", [])
         .unwrap();
-    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
-    assert_eq!(r.updated, 5, "every file re-parsed");
-    assert!(r.chunks > 0);
-    assert_eq!(
-        fx.store.meta("parser_version").unwrap().as_deref(),
-        Some(index::PARSER_VERSION)
+    // Re-parse only proj-b; the other roots must still be marked stale.
+    let opts = IndexOptions {
+        only_root: Some(fx.base.join("proj-b/notes")),
+        ..Default::default()
+    };
+    let r = index::run(&fx.config, &mut fx.store, &opts).unwrap();
+    assert_eq!(r.updated, 1);
+    let stale = count(
+        &fx.store,
+        &format!(
+            "SELECT COUNT(*) FROM roots WHERE parser_version IS NOT '{}'",
+            index::PARSER_VERSION
+        ),
     );
+    assert_eq!(stale, 2);
     let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
-    assert_eq!(r.unchanged, 5);
+    assert_eq!(
+        r.updated, 4,
+        "remaining roots re-parsed on the next full run"
+    );
+}
+
+#[test]
+fn frontmatter_dates_are_normalised_for_ordering() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    let dir = fx.base.join("proj-b/notes");
+    write(
+        &dir.join("old.md"),
+        "---\ndate: 2020-01-05\n---\n# Old\n\nold content long enough to be a chunk of text\n",
+    );
+    write(
+        &dir.join("mid.md"),
+        "---\nupdated: 2023-06-01 12:00\n---\n# Mid\n\nmid content long enough to be a chunk of text\n",
+    );
+    age(&dir.join("old.md"));
+    age(&dir.join("mid.md"));
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let rows: Vec<(String, Option<String>)> = fx
+        .store
+        .conn()
+        .prepare("SELECT rel_path, updated FROM docs WHERE rel_path IN ('old.md','mid.md') ORDER BY rel_path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows[0].1.as_deref(), Some("2023-06-01T12:00:00Z"));
+    // `date:` sets created, not updated; updated falls back to the filesystem.
+    assert!(rows[1].1.as_deref().unwrap().starts_with("20"));
+    let recent = list::run(
+        &fx.store,
+        &ListFilter {
+            recent_days: Some(30),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(recent.iter().all(|d| d.rel_path != "mid.md"));
+    let all = list::run(&fx.store, &ListFilter::default()).unwrap();
+    assert_eq!(
+        all.last().unwrap().rel_path,
+        "mid.md",
+        "oldest updated sorts last"
+    );
+}
+
+#[test]
+fn non_utf8_file_is_indexed_lossily_not_fatal() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    let bad = fx.base.join("proj-b/notes/latin1.md");
+    std::fs::write(
+        &bad,
+        b"# Caf\xe9\n\nbody with a stray byte \xff here and more words after\n",
+    )
+    .unwrap();
+    age(&bad);
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.errors, 0);
+    assert_eq!(
+        count(
+            &fx.store,
+            "SELECT COUNT(*) FROM docs WHERE rel_path = 'latin1.md' AND active = 1"
+        ),
+        1
+    );
 }
