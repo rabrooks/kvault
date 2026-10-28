@@ -167,7 +167,8 @@ fn ago(t: jiff::Timestamp) -> String {
 }
 
 /// The project a directory belongs to: the nearest ancestor (the directory
-/// itself first) whose name is a project some root was configured with.
+/// itself first) whose name is a project some root was configured with, or
+/// an alias of one. Returns the canonical name.
 ///
 /// # Errors
 /// Returns an error if the roots cannot be read.
@@ -177,10 +178,12 @@ pub fn project_for(store: &Store, cwd: &Path) -> Result<Option<String>> {
         .prepare_cached("SELECT DISTINCT project FROM roots WHERE project IS NOT NULL")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<_, _>>()?;
+    let aliases = store.project_aliases()?;
     let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     Ok(dir
         .ancestors()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|name| aliases.get(&name).cloned().unwrap_or(name))
         .find(|name| known.contains(name)))
 }
 

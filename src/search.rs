@@ -19,7 +19,8 @@
 //! excluded tag removes the document.
 //!
 //! Fusion is reciprocal rank fusion (`k = 60`), then a bounded authority
-//! multiplier from the root weight and `pinned` frontmatter. Results are one
+//! multiplier from the root weight, `pinned` frontmatter, and the root's
+//! demotion globs (`archive/` by default). Results are one
 //! chunk per document unless `per_chunk` is set.
 
 use std::collections::{HashMap, HashSet};
@@ -422,6 +423,10 @@ pub struct Explain {
     pub streams: Vec<StreamRank>,
     pub rrf: f64,
     pub authority: f64,
+    /// The demotion factor folded into `authority`, when a root's `demote`
+    /// glob matched this document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demoted: Option<f64>,
 }
 
 /// A ranked hit at chunk granularity, with enough document context to print.
@@ -485,12 +490,12 @@ struct Filter {
 }
 
 impl Filter {
-    fn build(opts: &SearchOptions, query: &Query) -> Result<Self> {
+    fn build(store: &Store, opts: &SearchOptions, query: &Query) -> Result<Self> {
         let mut sql = String::new();
         let mut params: Vec<Box<dyn ToSql>> = Vec::new();
         if let Some(p) = &opts.project {
             sql.push_str(" AND r.project = ?");
-            params.push(Box::new(p.clone()));
+            params.push(Box::new(store.canonical_project(p)?));
         }
         if let Some(root) = &opts.root {
             // Roots are stored without a trailing separator.
@@ -577,7 +582,7 @@ pub fn run(store: &Store, query: &Query, opts: &SearchOptions) -> Result<SearchR
     if query.is_empty() {
         return Err(Error::Other(anyhow::anyhow!("empty query")));
     }
-    let filter = Filter::build(opts, query)?;
+    let filter = Filter::build(store, opts, query)?;
     let excluded = excluded_chunks(store, query)?;
     let mut streams = Vec::new();
 
@@ -947,11 +952,12 @@ fn collapse(fused: Vec<Fused>) -> Vec<Fused> {
     out
 }
 
-/// Authority multiplier from the root weight and `pinned` frontmatter:
-/// `1 + (weight - 1) * 0.25`, times the pinned bonus, clamped to
-/// `[0.85, 1.15]`. A memory root at weight 1.2 scores 1.05; reference at
-/// 0.8 scores 0.95.
-fn authority(root_weight: f64, frontmatter: Option<&str>) -> f64 {
+/// Authority multiplier from the root weight, `pinned` frontmatter and
+/// demotion: `1 + (weight - 1) * 0.25`, times the pinned bonus, times the
+/// demotion factor (1.0 when not demoted), clamped to `[0.85, 1.15]`. A
+/// memory root at weight 1.2 scores 1.05; reference at 0.8 scores 0.95; an
+/// archived note in a weight-1.0 root at the default factor scores 0.90.
+fn authority(root_weight: f64, frontmatter: Option<&str>, demote: f64) -> f64 {
     let pinned = frontmatter
         .and_then(|f| serde_json::from_str::<serde_json::Value>(f).ok())
         .is_some_and(|v| v.get("pinned").and_then(serde_json::Value::as_bool) == Some(true));
@@ -959,7 +965,30 @@ fn authority(root_weight: f64, frontmatter: Option<&str>) -> f64 {
     if pinned {
         m *= PINNED_BONUS;
     }
-    m.clamp(AUTHORITY_MIN, AUTHORITY_MAX)
+    (m * demote).clamp(AUTHORITY_MIN, AUTHORITY_MAX)
+}
+
+/// Compiled demotion globs per root path, built lazily for the roots that
+/// appear among the hits being loaded.
+#[derive(Default)]
+struct Demotions(HashMap<String, (globset::GlobSet, f64)>);
+
+impl Demotions {
+    /// The factor for `rel_path` under a root, if one of its globs matches.
+    fn factor(
+        &mut self,
+        root_path: &str,
+        globs: Option<&str>,
+        factor: f64,
+        rel_path: &str,
+    ) -> Option<f64> {
+        let globs = globs?;
+        let (set, factor) = self.0.entry(root_path.to_owned()).or_insert_with(|| {
+            let patterns: Vec<String> = serde_json::from_str(globs).unwrap_or_default();
+            (crate::roots::demote_set(&patterns), factor)
+        });
+        set.is_match(rel_path).then_some(*factor)
+    }
 }
 
 /// Load rows for the fused candidates and their siblings in one query.
@@ -973,23 +1002,35 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
         .collect();
     let placeholders = vec!["?"; ids.len()].join(", ");
     let sql = format!(
-        "SELECT {CHUNK_REF_COLUMNS}, c.tokens, d.updated, d.frontmatter, r.kind, r.weight
+        "SELECT {CHUNK_REF_COLUMNS}, c.tokens, d.updated, d.frontmatter, r.kind, r.weight,
+                r.demote, r.demote_factor
          FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
          WHERE c.id IN ({placeholders})"
     );
     let mut stmt = store.conn().prepare(&sql)?;
+    let mut demotions = Demotions::default();
     let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
         let chunk = chunk_ref_from_row(r)?;
         let frontmatter: Option<String> = r.get(15)?;
         let weight: f64 = r.get(17)?;
+        let globs: Option<String> = r.get(18)?;
+        let demoted = demotions.factor(
+            &chunk.doc.root_path,
+            globs.as_deref(),
+            r.get(19)?,
+            &chunk.doc.rel_path,
+        );
         Ok(Hit {
             display_path: chunk.doc.display_path(),
             tokens: r.get(13)?,
             updated: r.get(14)?,
             root_kind: r.get(16)?,
-            score: authority(weight, frontmatter.as_deref()),
+            score: authority(weight, frontmatter.as_deref(), demoted.unwrap_or(1.0)),
             siblings: Vec::new(),
-            explain: Explain::default(),
+            explain: Explain {
+                demoted,
+                ..Explain::default()
+            },
             chunk,
         })
     })?;
@@ -1007,6 +1048,7 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
             streams: f.streams.clone(),
             rrf: f.rrf,
             authority: auth,
+            demoted: hit.explain.demoted,
         };
         hit.siblings = f
             .siblings
@@ -1183,12 +1225,17 @@ mod tests {
 
     #[test]
     fn authority_is_bounded() {
-        assert!((authority(1.0, None) - 1.0).abs() < f64::EPSILON);
-        assert!((authority(1.2, None) - 1.05).abs() < 1e-12);
-        assert!((authority(0.8, None) - 0.95).abs() < 1e-12);
-        assert!((authority(1.2, Some(r#"{"pinned":true}"#)) - 1.1025).abs() < 1e-12);
-        assert!((authority(0.0, None) - AUTHORITY_MIN).abs() < f64::EPSILON);
-        assert!((authority(9.0, None) - AUTHORITY_MAX).abs() < f64::EPSILON);
+        assert!((authority(1.0, None, 1.0) - 1.0).abs() < f64::EPSILON);
+        assert!((authority(1.2, None, 1.0) - 1.05).abs() < 1e-12);
+        assert!((authority(0.8, None, 1.0) - 0.95).abs() < 1e-12);
+        assert!((authority(1.2, Some(r#"{"pinned":true}"#), 1.0) - 1.1025).abs() < 1e-12);
+        assert!((authority(0.0, None, 1.0) - AUTHORITY_MIN).abs() < f64::EPSILON);
+        assert!((authority(9.0, None, 1.0) - AUTHORITY_MAX).abs() < f64::EPSILON);
+        assert!((authority(1.0, None, 0.9) - 0.9).abs() < 1e-12);
+        assert!(
+            (authority(0.8, None, 0.5) - AUTHORITY_MIN).abs() < f64::EPSILON,
+            "demotion stays inside the band however strong"
+        );
     }
 
     #[test]

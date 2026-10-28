@@ -152,8 +152,13 @@ fn explain_line(h: &Hit) -> String {
         .iter()
         .map(|s| format!("{}#{} ({:.2})", s.stream, s.rank, s.raw))
         .collect();
+    let demoted = h
+        .explain
+        .demoted
+        .map(|f| format!(" (demoted ×{f:.2})"))
+        .unwrap_or_default();
     format!(
-        "{}  rrf {:.4} × auth {:.2} = {:.4}",
+        "{}  rrf {:.4} × auth {:.2}{demoted} = {:.4}",
         parts.join("  "),
         h.explain.rrf,
         h.explain.authority,

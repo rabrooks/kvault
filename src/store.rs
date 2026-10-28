@@ -4,6 +4,7 @@
 //! reproduce it exactly. Schema changes bump `PRAGMA user_version` and add a
 //! migration step; there is no down-migration, a rebuild is the rollback.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
@@ -11,7 +12,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use crate::error::{Error, Result};
 
 /// Current schema version. Bump with every DDL change.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Minimum `SQLite` version: `FTS5` `contentless_delete` arrived in 3.43.0.
 pub const MIN_SQLITE_VERSION: i32 = 3_043_000;
@@ -116,6 +117,19 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 ALTER TABLE roots ADD COLUMN parser_version TEXT;
 "#;
 
+/// v3: per-root demotion globs (JSON array, relative to the root) and the
+/// authority factor applied to matching files. Written on every index run
+/// from config, so no re-parse is needed.
+const MIGRATE_V3: &str = "
+ALTER TABLE roots ADD COLUMN demote TEXT;
+ALTER TABLE roots ADD COLUMN demote_factor REAL NOT NULL DEFAULT 1.0;
+";
+
+/// `meta` key holding the configured project aliases as a JSON object,
+/// alias → canonical name. Written by `index` so readers that never load
+/// the config (search, list, brief) resolve names the same way.
+pub const PROJECT_ALIASES_KEY: &str = "project_aliases";
+
 /// An open index database.
 pub struct Store {
     conn: Connection,
@@ -213,6 +227,10 @@ impl Store {
             self.conn.execute_batch(MIGRATE_V2)?;
             current = 2;
         }
+        if current == 2 {
+            self.conn.execute_batch(MIGRATE_V3)?;
+            current = 3;
+        }
         debug_assert_eq!(current, SCHEMA_VERSION);
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -270,6 +288,29 @@ impl Store {
             })
             .optional()?)
     }
+
+    /// The project aliases recorded by the last `index` run.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn project_aliases(&self) -> Result<BTreeMap<String, String>> {
+        Ok(self
+            .meta(PROJECT_ALIASES_KEY)?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default())
+    }
+
+    /// The canonical name for a project name a user typed or a directory
+    /// is called: its alias target if it is an alias, else itself.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn canonical_project(&self, name: &str) -> Result<String> {
+        Ok(self
+            .project_aliases()?
+            .remove(name)
+            .unwrap_or_else(|| name.to_owned()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -303,7 +344,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("3"));
         let tables: Vec<String> = s
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table') ORDER BY name")

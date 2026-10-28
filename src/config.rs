@@ -31,6 +31,19 @@ pub struct Config {
     pub brief: BriefConfig,
     /// Path-prefix descriptions injected onto hits under that prefix.
     pub context: BTreeMap<String, String>,
+    /// Per-project settings, keyed by the project's canonical name.
+    pub projects: BTreeMap<String, ProjectConfig>,
+}
+
+/// Settings for one project, `[projects.<name>]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Other names roots derive for this project. A root whose
+    /// `project_from` yields an alias is indexed under the canonical name,
+    /// so two roots that name the same project differently (a notes dir's
+    /// parent `mas`, a Claude memory slug `work-mas`) share one project.
+    pub aliases: Vec<String>,
 }
 
 /// One indexed root. `path` may contain `~` and glob metacharacters
@@ -47,10 +60,47 @@ pub struct RootConfig {
     /// How to derive the project name for files under this root.
     #[serde(default)]
     pub project_from: ProjectFrom,
+    /// Globs, relative to the root, whose files rank below their peers:
+    /// still searchable, but a close live note wins. Empty disables.
+    #[serde(default = "default_demote")]
+    pub demote: Vec<String>,
+    /// Authority factor for demoted files, in `(0, 1]`. Applied inside the
+    /// authority clamp, so it can never move a hit by more than the band.
+    #[serde(default = "default_demote_factor")]
+    pub demote_factor: f64,
 }
 
 fn default_weight() -> f64 {
     1.0
+}
+
+/// Finished work conventionally lives under `archive/` at any depth.
+fn default_demote() -> Vec<String> {
+    vec!["**/archive/**".to_owned()]
+}
+
+/// About six RRF ranks at the top of a k=60 list: enough for a live note to
+/// beat an archived one of similar relevance, not enough to bury a clearly
+/// better archived hit.
+pub const DEFAULT_DEMOTE_FACTOR: f64 = 0.9;
+
+fn default_demote_factor() -> f64 {
+    DEFAULT_DEMOTE_FACTOR
+}
+
+impl RootConfig {
+    /// A root with the default weight and demotion.
+    #[must_use]
+    pub fn new(path: impl Into<String>, kind: RootKind, project_from: ProjectFrom) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+            weight: default_weight(),
+            project_from,
+            demote: default_demote(),
+            demote_factor: default_demote_factor(),
+        }
+    }
 }
 
 /// Strategy for naming the project a root's files belong to.
@@ -125,7 +175,60 @@ impl Config {
             source: e,
         };
         let text = std::fs::read_to_string(path).map_err(|e| wrap(e.into()))?;
-        toml::from_str(&text).map_err(|e| wrap(e.into()))
+        let config: Self = toml::from_str(&text).map_err(|e| wrap(e.into()))?;
+        config.validate().map_err(wrap)?;
+        Ok(config)
+    }
+
+    /// Reject settings that parse but cannot mean anything coherent.
+    ///
+    /// # Errors
+    /// Describes the first problem found.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for root in &self.roots {
+            if !(root.demote_factor > 0.0 && root.demote_factor <= 1.0) {
+                anyhow::bail!(
+                    "root {}: demote_factor must be in (0, 1], got {}",
+                    root.path,
+                    root.demote_factor
+                );
+            }
+            for pattern in &root.demote {
+                crate::roots::demote_glob(pattern)
+                    .map_err(|e| anyhow::anyhow!("root {}: demote {pattern:?}: {e}", root.path))?;
+            }
+        }
+        let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, project) in &self.projects {
+            for alias in &project.aliases {
+                if alias == name {
+                    continue;
+                }
+                // One level only: an alias that is itself canonical would make
+                // the project a name resolves to depend on lookup order.
+                if self.projects.contains_key(alias) {
+                    anyhow::bail!(
+                        "project alias {alias:?} (of {name:?}) is also a [projects] name"
+                    );
+                }
+                if let Some(prev) = owner.insert(alias, name) {
+                    anyhow::bail!(
+                        "project alias {alias:?} is claimed by both {prev:?} and {name:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Alias → canonical project name, for every configured alias.
+    #[must_use]
+    pub fn project_aliases(&self) -> BTreeMap<String, String> {
+        self.projects
+            .iter()
+            .flat_map(|(name, p)| p.aliases.iter().map(move |a| (a.clone(), name.clone())))
+            .filter(|(alias, name)| alias != name)
+            .collect()
     }
 
     /// The config file path: `KVAULT_CONFIG`, else `$XDG_CONFIG_HOME/kvault/config.toml`,
@@ -164,22 +267,17 @@ impl Config {
     pub fn suggested_roots() -> Vec<RootConfig> {
         vec![
             RootConfig {
-                path: "~/.claude/projects/*/memory".to_owned(),
-                kind: RootKind::Memory,
                 weight: 1.2,
-                project_from: ProjectFrom::ClaudeSlug,
+                ..RootConfig::new(
+                    "~/.claude/projects/*/memory",
+                    RootKind::Memory,
+                    ProjectFrom::ClaudeSlug,
+                )
             },
+            RootConfig::new("~/Projects/*/notes", RootKind::Notes, ProjectFrom::Parent),
             RootConfig {
-                path: "~/Projects/*/notes".to_owned(),
-                kind: RootKind::Notes,
-                weight: 1.0,
-                project_from: ProjectFrom::Parent,
-            },
-            RootConfig {
-                path: "~/Projects/notes".to_owned(),
-                kind: RootKind::Reference,
                 weight: 0.8,
-                project_from: ProjectFrom::None,
+                ..RootConfig::new("~/Projects/notes", RootKind::Reference, ProjectFrom::None)
             },
         ]
     }
@@ -265,6 +363,57 @@ budget = 1500
     fn unknown_keys_are_rejected() {
         let err = toml::from_str::<Config>("[brief]\nbudgett = 3\n").unwrap_err();
         assert!(err.to_string().contains("budgett"));
+    }
+
+    #[test]
+    fn demote_defaults_to_archive_dirs() {
+        let c: Config = toml::from_str("[[roots]]\npath = \"/x\"\n").unwrap();
+        assert_eq!(c.roots[0].demote, vec!["**/archive/**".to_owned()]);
+        assert!((c.roots[0].demote_factor - DEFAULT_DEMOTE_FACTOR).abs() < f64::EPSILON);
+        let c: Config =
+            toml::from_str("[[roots]]\npath = \"/x\"\ndemote = []\ndemote_factor = 0.95\n")
+                .unwrap();
+        assert!(c.roots[0].demote.is_empty());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_demote_settings_are_rejected() {
+        let bad_factor: Config =
+            toml::from_str("[[roots]]\npath = \"/x\"\ndemote_factor = 1.5\n").unwrap();
+        assert!(
+            bad_factor
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("demote_factor")
+        );
+        let bad_glob: Config =
+            toml::from_str("[[roots]]\npath = \"/x\"\ndemote = [\"a/[\"]\n").unwrap();
+        assert!(bad_glob.validate().is_err());
+    }
+
+    #[test]
+    fn project_aliases_map_to_canonical_names() {
+        let c: Config =
+            toml::from_str("[projects.mas]\naliases = [\"work-mas\", \"mas\"]\n[projects.other]\n")
+                .unwrap();
+        c.validate().unwrap();
+        let aliases = c.project_aliases();
+        assert_eq!(aliases.len(), 1, "the canonical name is not its own alias");
+        assert_eq!(aliases.get("work-mas").map(String::as_str), Some("mas"));
+    }
+
+    #[test]
+    fn ambiguous_project_aliases_are_rejected() {
+        let twice: Config =
+            toml::from_str("[projects.a]\naliases = [\"x\"]\n[projects.b]\naliases = [\"x\"]\n")
+                .unwrap();
+        assert!(twice.validate().unwrap_err().to_string().contains("both"));
+        let chained: Config =
+            toml::from_str("[projects.a]\naliases = [\"b\"]\n[projects.b]\n").unwrap();
+        assert!(chained.validate().is_err());
+        assert!(toml::from_str::<Config>("[projects.a]\nalias = [\"b\"]\n").is_err());
     }
 
     #[test]

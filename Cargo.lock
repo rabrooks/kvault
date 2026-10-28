@@ -501,6 +501,7 @@ dependencies = [
  "clap",
  "directories",
  "glob",
+ "globset",
  "ignore",
  "jiff",
  "predicates",

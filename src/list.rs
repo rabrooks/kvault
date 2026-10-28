@@ -56,7 +56,7 @@ pub fn run(store: &Store, filter: &ListFilter) -> Result<Vec<DocSummary>> {
     }
     if let Some(project) = &filter.project {
         sql.push_str(" AND r.project = ?");
-        args.push(Box::new(project.clone()));
+        args.push(Box::new(store.canonical_project(project)?));
     }
     if let Some(tag) = &filter.tag {
         sql.push_str(" AND d.id IN (SELECT doc_id FROM tags WHERE tag = ?)");

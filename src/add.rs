@@ -136,7 +136,7 @@ fn other(msg: impl Into<String>) -> Error {
 
 /// Pick the directory to write into and the configured root it is under.
 fn target(config: &Config, store: &Store, opts: &AddOptions) -> Result<(PathBuf, Option<Root>)> {
-    let expanded = roots::expand(&config.roots);
+    let expanded = roots::expand(&config.roots, &config.project_aliases());
     if let Some(dir) = &opts.root {
         if !dir.is_dir() {
             return Err(other(format!(
@@ -152,7 +152,7 @@ fn target(config: &Config, store: &Store, opts: &AddOptions) -> Result<(PathBuf,
         return Ok((dir.clone(), root));
     }
     let project = match &opts.project {
-        Some(p) => Some(p.clone()),
+        Some(p) => Some(store.canonical_project(p)?),
         None => brief::project_for(store, &opts.cwd)?,
     };
     let Some(project) = project else {

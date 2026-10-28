@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::markdown::{self, Parsed};
 use crate::roots::{self, Root};
-use crate::store::Store;
+use crate::store::{PROJECT_ALIASES_KEY, Store};
 
 /// A file modified within this window of the stored hash time is re-read
 /// even if mtime and size match, because mtime granularity can hide an edit.
@@ -96,7 +96,7 @@ impl std::fmt::Display for IndexReport {
 /// Returns an error if the database cannot be written.
 pub fn reindex_root_containing(config: &Config, store: &mut Store, path: &Path) -> Result<bool> {
     let file = canonical_file(path);
-    let root = roots::expand(&config.roots)
+    let root = roots::expand(&config.roots, &config.project_aliases())
         .into_iter()
         .find(|r| file.starts_with(canonical_dir(&r.path)));
     let Some(root) = root else {
@@ -136,7 +136,8 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
     let started = Instant::now();
     let mut report = IndexReport::default();
 
-    let expanded = roots::expand(&config.roots);
+    let aliases = config.project_aliases();
+    let expanded = roots::expand(&config.roots, &aliases);
     let selected: Vec<&Root> = expanded
         .iter()
         .filter(|r| opts.only_root.as_ref().is_none_or(|p| &r.path == p))
@@ -178,7 +179,12 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
 
     report.links_unresolved = resolve_links(&tx)?;
     let now = jiff::Timestamp::now().to_string();
-    for (key, value) in [("last_index_at", now.as_str()), ("tokenizer", TOKENIZER_ID)] {
+    let aliases = serde_json::to_string(&aliases).map_err(|e| Error::Other(e.into()))?;
+    for (key, value) in [
+        ("last_index_at", now.as_str()),
+        ("tokenizer", TOKENIZER_ID),
+        (PROJECT_ALIASES_KEY, aliases.as_str()),
+    ] {
         tx.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -203,11 +209,25 @@ fn known_root_paths(tx: &Transaction<'_>) -> Result<Vec<PathBuf>> {
 /// Returns the root id and whether its files must be re-parsed.
 fn upsert_root(tx: &Transaction<'_>, root: &Root) -> Result<(i64, bool)> {
     let path = root.path.to_string_lossy();
+    let demote = if root.demote.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&root.demote).map_err(|e| Error::Other(e.into()))?)
+    };
     tx.execute(
-        "INSERT INTO roots(path, kind, weight, project) VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO roots(path, kind, weight, project, demote, demote_factor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET kind = excluded.kind, weight = excluded.weight,
-                                         project = excluded.project",
-        params![path, root.kind.as_str(), root.weight, root.project],
+                                         project = excluded.project, demote = excluded.demote,
+                                         demote_factor = excluded.demote_factor",
+        params![
+            path,
+            root.kind.as_str(),
+            root.weight,
+            root.project,
+            demote,
+            root.demote_factor
+        ],
     )?;
     let (id, parser_version): (i64, Option<String>) = tx.query_row(
         "SELECT id, parser_version FROM roots WHERE path = ?1",

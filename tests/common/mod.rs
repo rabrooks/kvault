@@ -79,17 +79,18 @@ pub fn fixture() -> Fixture {
     );
     let config = Config {
         roots: vec![
+            RootConfig::new(
+                format!("{}/*/notes", base.display()),
+                RootKind::Notes,
+                ProjectFrom::Parent,
+            ),
             RootConfig {
-                path: format!("{}/*/notes", base.display()),
-                kind: RootKind::Notes,
-                weight: 1.0,
-                project_from: ProjectFrom::Parent,
-            },
-            RootConfig {
-                path: format!("{}/mem/*/memory", base.display()),
-                kind: RootKind::Memory,
                 weight: 1.2,
-                project_from: ProjectFrom::ClaudeSlug,
+                ..RootConfig::new(
+                    format!("{}/mem/*/memory", base.display()),
+                    RootKind::Memory,
+                    ProjectFrom::ClaudeSlug,
+                )
             },
         ],
         ..Config::default()

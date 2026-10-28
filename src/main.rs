@@ -156,7 +156,7 @@ fn init(force: bool) -> kvault::Result<()> {
     }
     let mut config = Config::default();
     for root in Config::suggested_roots() {
-        let present = roots::expand(std::slice::from_ref(&root));
+        let present = roots::expand(std::slice::from_ref(&root), &config.project_aliases());
         if present.is_empty() {
             println!("skip   {:<32} (no matching directories)", root.path);
         } else {
@@ -326,7 +326,7 @@ fn status() -> kvault::Result<()> {
         }
     );
 
-    let expanded = roots::expand(&config.roots);
+    let expanded = roots::expand(&config.roots, &config.project_aliases());
     println!(
         "roots:   {} configured, {} present",
         config.roots.len(),

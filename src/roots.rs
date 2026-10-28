@@ -1,6 +1,9 @@
 //! Roots: the directories kvault indexes in place.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,25 +44,33 @@ pub struct Root {
     pub kind: RootKind,
     pub weight: f64,
     pub project: Option<String>,
+    /// Globs relative to the root whose files are demoted; see [`demote_set`].
+    pub demote: Vec<String>,
+    pub demote_factor: f64,
 }
 
 /// Expand every configured root pattern into existing directories.
 ///
 /// Patterns may start with `~/` and may contain glob metacharacters. Missing
 /// directories are skipped silently: a temporarily absent root is never an
-/// error and never a mass delete.
+/// error and never a mass delete. A derived project name found in `aliases`
+/// (alias → canonical, from [`crate::config::Config::project_aliases`]) is
+/// replaced by its canonical name.
 #[must_use]
-pub fn expand(configs: &[RootConfig]) -> Vec<Root> {
+pub fn expand(configs: &[RootConfig], aliases: &BTreeMap<String, String>) -> Vec<Root> {
     let mut out = Vec::new();
     for cfg in configs {
         let pattern = expand_tilde(&cfg.path);
         for dir in glob_dirs(&pattern) {
-            let project = derive_project(&dir, cfg.project_from);
+            let project = derive_project(&dir, cfg.project_from)
+                .map(|p| aliases.get(&p).cloned().unwrap_or(p));
             out.push(Root {
                 path: dir,
                 kind: cfg.kind,
                 weight: cfg.weight,
                 project,
+                demote: cfg.demote.clone(),
+                demote_factor: cfg.demote_factor,
             });
         }
     }
@@ -88,6 +99,29 @@ fn glob_dirs(pattern: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Compile one demotion glob. `*` stays within a path segment and `**/`
+/// also matches zero directories, so `**/archive/**` covers `archive/x.md`
+/// at the top of the root as well as `plans/archive/x.md`.
+///
+/// # Errors
+/// Returns the parse error for a malformed pattern.
+pub fn demote_glob(pattern: &str) -> std::result::Result<Glob, globset::Error> {
+    GlobBuilder::new(pattern).literal_separator(true).build()
+}
+
+/// Compile a root's demotion globs, skipping malformed ones (config
+/// validation reports those before anything is indexed).
+#[must_use]
+pub fn demote_set(patterns: &[String]) -> GlobSet {
+    let mut b = GlobSetBuilder::new();
+    for p in patterns {
+        if let Ok(g) = demote_glob(p) {
+            b.add(g);
+        }
+    }
+    b.build().unwrap_or_else(|_| GlobSet::empty())
 }
 
 /// Derive a project name for a root directory.
@@ -168,26 +202,45 @@ mod tests {
         std::fs::create_dir_all(base.join("a/notes")).unwrap();
         std::fs::create_dir_all(base.join("b/notes")).unwrap();
         std::fs::write(base.join("c"), "file, not dir").unwrap();
-        let cfg = RootConfig {
-            path: format!("{}/*/notes", base.display()),
-            kind: RootKind::Notes,
-            weight: 1.0,
-            project_from: ProjectFrom::Parent,
-        };
-        let roots = expand(&[cfg]);
+        let cfg = RootConfig::new(
+            format!("{}/*/notes", base.display()),
+            RootKind::Notes,
+            ProjectFrom::Parent,
+        );
+        let roots = expand(std::slice::from_ref(&cfg), &BTreeMap::new());
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].project.as_deref(), Some("a"));
         assert_eq!(roots[1].project.as_deref(), Some("b"));
+
+        let aliases = BTreeMap::from([("b".to_owned(), "a".to_owned())]);
+        let roots = expand(&[cfg], &aliases);
+        assert_eq!(
+            roots[1].project.as_deref(),
+            Some("a"),
+            "alias resolves to canonical"
+        );
     }
 
     #[test]
     fn expand_skips_missing_plain_path() {
-        let cfg = RootConfig {
-            path: "/definitely/not/here".to_owned(),
-            kind: RootKind::Other,
-            weight: 1.0,
-            project_from: ProjectFrom::None,
-        };
-        assert!(expand(&[cfg]).is_empty());
+        let cfg = RootConfig::new("/definitely/not/here", RootKind::Other, ProjectFrom::None);
+        assert!(expand(&[cfg], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn default_demote_matches_archive_at_any_depth() {
+        let set = demote_set(&["**/archive/**".to_owned()]);
+        assert!(set.is_match("archive/old.md"));
+        assert!(set.is_match("plans/archive/old.md"));
+        assert!(set.is_match("a/b/archive/c/old.md"));
+        assert!(!set.is_match("plans/live.md"));
+        assert!(!set.is_match("plans/archived.md"));
+        assert!(!set.is_match("archive.md"));
+        let star = demote_set(&["drafts/*.md".to_owned()]);
+        assert!(star.is_match("drafts/x.md"));
+        assert!(
+            !star.is_match("drafts/sub/x.md"),
+            "* stays within a segment"
+        );
     }
 }
