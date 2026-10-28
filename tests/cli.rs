@@ -80,11 +80,6 @@ fn unimplemented_commands_exit_3_with_milestone() {
         .code(3)
         .stderr(predicate::str::contains("M5"));
     kvault()
-        .args(["recall", "anything"])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("M3"));
-    kvault()
         .args(["hook", "session-start"])
         .assert()
         .code(3)

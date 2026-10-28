@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::cli::SearchFormat;
 use crate::error::Result;
 use crate::get;
+use crate::pack::truncate;
 use crate::search::{Hit, SearchResult};
 
 /// Longest snippet line printed, in characters.
@@ -41,25 +42,16 @@ pub fn snippet(h: &Hit, needles: &[String]) -> Option<Snippet> {
         if !is_heading && needles.iter().any(|t| lower.contains(t.as_str())) {
             return Some(Snippet {
                 line: n,
-                text: truncate(trimmed),
+                text: truncate(trimmed, SNIPPET_CHARS),
                 stale: text.stale,
             });
         }
     }
     fallback.map(|(line, t)| Snippet {
         line,
-        text: truncate(t),
+        text: truncate(t, SNIPPET_CHARS),
         stale: text.stale,
     })
-}
-
-fn truncate(s: &str) -> String {
-    if s.chars().count() <= SNIPPET_CHARS {
-        return s.to_owned();
-    }
-    let mut out: String = s.chars().take(SNIPPET_CHARS - 1).collect();
-    out.push('…');
-    out
 }
 
 /// Render a search result in the requested format.
@@ -231,18 +223,4 @@ fn json(result: &SearchResult, needles: &[String]) -> Result<String> {
             .collect(),
     };
     Ok(serde_json::to_string_pretty(&out).map_err(|e| anyhow::anyhow!(e))? + "\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_keeps_short_lines_and_marks_long_ones() {
-        assert_eq!(truncate("short"), "short");
-        let long = "x".repeat(SNIPPET_CHARS + 20);
-        let t = truncate(&long);
-        assert_eq!(t.chars().count(), SNIPPET_CHARS);
-        assert!(t.ends_with('…'));
-    }
 }

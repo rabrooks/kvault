@@ -15,8 +15,8 @@ real use. Commands land milestone by milestone:
 | M0 | toolchain pin, module tree, schema v1, `status`, CI | done |
 | M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | done |
 | M2 | `search`, `get`, `--explain`, `bench` | done |
-| M3 | `recall` budget packer, `brief` | next |
-| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | |
+| M3 | `recall` budget packer, `brief` | done |
+| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | next |
 | M5 | links stream, `links` | |
 | M6 | MCP stdio adapter (`--features mcp`) | |
 
@@ -120,6 +120,31 @@ hit@5, MRR and latency over a query file (`{"query", "expected": ["path#heading"
 optionally against a case-insensitive grep over the same files. `--min-hit5` makes it a CI
 gate. On a 44-query bench over the real corpus (release build): kvault hit@1 0.95, hit@5 1.00,
 MRR 0.98, p50 1 ms; grep hit@1 0.59, hit@5 0.98, MRR 0.75, p50 10 ms.
+
+## Recall and brief
+
+`kvault recall "<query>" --budget 1500 [--project P] [--format md|json]` is `search` packed
+into a token budget. It is what agents call. Each hit is shown at one of three tiers: a
+one-line reference, the reference plus a two-line preview, or the whole chunk. The packer
+starts with the top three hits in full and the next seven previewed, then sheds from the
+bottom of the ranking (drop reference lines, downgrade previews, downgrade full chunks,
+downgrade the remaining previews, and only then drop hits) until the whole output, framing
+included, fits. A chunk is shown whole or not at all. The budget applies to the bytes
+printed in whichever format was asked for, as measured by the index's token counter; the
+output ends with the number of hits omitted (counted up to 200) and the `kvault get` hint.
+
+Shown text is verbatim except for trimming: frontmatter is dropped, trailing whitespace and
+runs of blank lines are collapsed. Nothing inside a line is rewritten, so `path:line`
+citations and code fences survive. A chunk whose file changed since it was indexed is
+marked `[stale]` and shown as a preview at most, never quoted in full.
+
+`kvault brief [--cwd P] [--budget N]` prints the context block the SessionStart hook injects
+for a working directory: pinned notes and rules, notes updated in the last 14 days, and
+notes elsewhere that link to or share tags with the project, one line each with a chunk id.
+The project is the nearest ancestor directory whose name matches a configured root's
+project. The block fits the budget (2000 tokens by default) and stays under 8,000 characters
+so Claude Code does not swap it for a file preview; the header line is byte-stable across
+runs except the counts and a coarse index age at its end.
 
 ## CLI (v0 surface)
 

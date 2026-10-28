@@ -30,7 +30,7 @@ use rusqlite::{ToSql, params_from_iter};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
-use crate::get::{ChunkRef, DocRef};
+use crate::get::{CHUNK_REF_COLUMNS, ChunkRef, DocRef, chunk_ref_from_row};
 use crate::store::Store;
 
 /// Reciprocal rank fusion constant.
@@ -973,47 +973,24 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
         .collect();
     let placeholders = vec!["?"; ids.len()].join(", ");
     let sql = format!(
-        "SELECT c.id, c.doc_id, c.blake3, c.heading_path, c.start_line, c.end_line,
-                c.byte_start, c.byte_end, c.tokens,
-                d.rel_path, d.title, d.mtime_ns, d.updated, d.frontmatter,
-                r.path, r.kind, r.project, r.weight
+        "SELECT {CHUNK_REF_COLUMNS}, c.tokens, d.updated, d.frontmatter, r.kind, r.weight
          FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
          WHERE c.id IN ({placeholders})"
     );
     let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
-        let root_path: String = r.get(14)?;
-        let project: Option<String> = r.get(16)?;
-        let rel_path: String = r.get(9)?;
-        let frontmatter: Option<String> = r.get(13)?;
+        let chunk = chunk_ref_from_row(r)?;
+        let frontmatter: Option<String> = r.get(15)?;
         let weight: f64 = r.get(17)?;
-        let blake3: String = r.get(2)?;
-        let chunk = ChunkRef {
-            chunk_id: r.get(0)?,
-            id: short_id(&blake3),
-            heading_path: r.get(3)?,
-            start_line: r.get(4)?,
-            end_line: r.get(5)?,
-            byte_start: usize::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
-            byte_end: usize::try_from(r.get::<_, i64>(7)?).unwrap_or(0),
-            doc: DocRef {
-                doc_id: r.get(1)?,
-                root_path: root_path.clone(),
-                project: project.clone(),
-                rel_path: rel_path.clone(),
-                title: r.get(10)?,
-                mtime_ns: r.get(11)?,
-            },
-        };
         Ok(Hit {
-            display_path: display_path(&root_path, project.as_deref(), &rel_path),
-            chunk,
-            root_kind: r.get(15)?,
-            tokens: r.get(8)?,
-            updated: r.get(12)?,
+            display_path: chunk.doc.display_path(),
+            tokens: r.get(13)?,
+            updated: r.get(14)?,
+            root_kind: r.get(16)?,
             score: authority(weight, frontmatter.as_deref()),
             siblings: Vec::new(),
             explain: Explain::default(),
+            chunk,
         })
     })?;
     let mut by_chunk: HashMap<i64, Hit> = rows

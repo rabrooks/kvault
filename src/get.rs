@@ -111,6 +111,33 @@ pub struct ChunkRef {
     pub doc: DocRef,
 }
 
+/// Columns, in order, that [`chunk_ref_from_row`] reads: use as the start
+/// of a select over `chunks c JOIN docs d JOIN roots r`.
+pub(crate) const CHUNK_REF_COLUMNS: &str =
+    "c.id, c.blake3, c.heading_path, c.start_line, c.end_line, c.byte_start, c.byte_end,
+     d.id, r.path, r.project, d.rel_path, d.title, d.mtime_ns";
+
+/// Build a [`ChunkRef`] from a row that starts with [`CHUNK_REF_COLUMNS`].
+pub(crate) fn chunk_ref_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRef> {
+    Ok(ChunkRef {
+        chunk_id: r.get(0)?,
+        id: short_id(&r.get::<_, String>(1)?),
+        heading_path: r.get(2)?,
+        start_line: r.get(3)?,
+        end_line: r.get(4)?,
+        byte_start: usize::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
+        byte_end: usize::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+        doc: DocRef {
+            doc_id: r.get(7)?,
+            root_path: r.get(8)?,
+            project: r.get(9)?,
+            rel_path: r.get(10)?,
+            title: r.get(11)?,
+            mtime_ns: r.get(12)?,
+        },
+    })
+}
+
 /// Text read from disk for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text {
@@ -139,23 +166,30 @@ pub fn read_chunk(chunk: &ChunkRef) -> Result<Text> {
     let path = chunk.doc.abs_path();
     let stale = is_stale(&path, chunk.doc.mtime_ns);
     let file = std::fs::read_to_string(&path)?;
+    Ok(slice_chunk(&file, chunk, stale))
+}
+
+/// [`read_chunk`] over file text the caller already read, so one read can
+/// serve every chunk of a document.
+#[must_use]
+pub fn slice_chunk(file: &str, chunk: &ChunkRef, stale: bool) -> Text {
     if !stale
         && chunk.byte_end <= file.len()
         && file.is_char_boundary(chunk.byte_start)
         && file.is_char_boundary(chunk.byte_end)
     {
-        return Ok(Text {
+        return Text {
             text: file[chunk.byte_start..chunk.byte_end].to_owned(),
             first_line: chunk.start_line,
             stale: false,
-        });
+        };
     }
     let count = chunk.end_line.saturating_sub(chunk.start_line) + 1;
-    Ok(Text {
-        text: window(&file, chunk.start_line, count),
+    Text {
+        text: window(file, chunk.start_line, count),
         first_line: chunk.start_line,
         stale: true,
-    })
+    }
 }
 
 /// Lines `from..from+count` (1-based, inclusive start) of `text`.
@@ -178,33 +212,15 @@ pub fn window(text: &str, from: u32, count: u32) -> String {
 /// documents (identical text in two files is reported as both).
 pub fn chunk_by_id(store: &Store, prefix: &str) -> Result<ChunkRef> {
     let upper = format!("{prefix}g");
-    let mut stmt = store.conn().prepare_cached(
-        "SELECT c.id, c.blake3, c.heading_path, c.start_line, c.end_line, c.byte_start, c.byte_end,
-                d.id, r.path, r.project, d.rel_path, d.title, d.mtime_ns
+    let sql = format!(
+        "SELECT {CHUNK_REF_COLUMNS}
          FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
          WHERE c.blake3 >= ?1 AND c.blake3 < ?2 AND d.active = 1
-         ORDER BY d.id, c.ordinal",
-    )?;
+         ORDER BY d.id, c.ordinal"
+    );
+    let mut stmt = store.conn().prepare_cached(&sql)?;
     let rows = stmt
-        .query_map([prefix, upper.as_str()], |r| {
-            Ok(ChunkRef {
-                chunk_id: r.get(0)?,
-                id: short_id(&r.get::<_, String>(1)?),
-                heading_path: r.get(2)?,
-                start_line: r.get(3)?,
-                end_line: r.get(4)?,
-                byte_start: usize::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
-                byte_end: usize::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
-                doc: DocRef {
-                    doc_id: r.get(7)?,
-                    root_path: r.get(8)?,
-                    project: r.get(9)?,
-                    rel_path: r.get(10)?,
-                    title: r.get(11)?,
-                    mtime_ns: r.get(12)?,
-                },
-            })
-        })?
+        .query_map([prefix, upper.as_str()], chunk_ref_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut docs: Vec<&ChunkRef> = Vec::new();
     for c in &rows {

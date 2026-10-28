@@ -4,11 +4,13 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use kvault::bench::BenchOptions;
-use kvault::cli::{Cli, Command, SearchArgs};
+use kvault::brief::BriefOptions;
+use kvault::cli::{Cli, Command, RecallFormat, SearchArgs};
 use kvault::config::{Config, expand_tilde};
 use kvault::error::{Error, Milestone};
 use kvault::index::{self, IndexOptions};
 use kvault::list::{self, ListFilter};
+use kvault::recall::RecallOptions;
 use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
 use kvault::{get, render, roots};
@@ -63,8 +65,13 @@ fn run(command: Command) -> kvault::Result<()> {
             print!("{out}");
             Ok(())
         }
-        Command::Recall { .. } => not_yet("recall", Milestone::M3Recall),
-        Command::Brief { .. } => not_yet("brief", Milestone::M3Recall),
+        Command::Recall {
+            query,
+            budget,
+            project,
+            format,
+        } => recall(&query, budget, project, format),
+        Command::Brief { cwd, budget } => brief(cwd.as_deref(), budget),
         Command::Add { .. } => not_yet("add", Milestone::M4Hooks),
         Command::Hook { .. } => not_yet("hook", Milestone::M4Hooks),
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
@@ -156,6 +163,46 @@ fn search(args: &SearchArgs) -> kvault::Result<()> {
     };
     let result = kvault::search::run(&store, &query, &opts)?;
     print!("{}", render::render(&result, args.format, args.explain)?);
+    Ok(())
+}
+
+fn recall(
+    query: &str,
+    budget: usize,
+    project: Option<String>,
+    format: RecallFormat,
+) -> kvault::Result<()> {
+    let store = open_store()?;
+    let query = Query::parse(query);
+    let result = kvault::recall::run(
+        &store,
+        &query,
+        &RecallOptions {
+            budget,
+            project,
+            format,
+        },
+    )?;
+    if result.text.is_empty() {
+        eprintln!("budget {budget} is too small for any output");
+    }
+    print!("{}", result.text);
+    Ok(())
+}
+
+fn brief(cwd: Option<&str>, budget: Option<usize>) -> kvault::Result<()> {
+    let config = Config::load()?;
+    let store = open_store()?;
+    let cwd = match cwd {
+        Some(p) => expand_tilde(p),
+        None => std::env::current_dir()?,
+    };
+    let opts = BriefOptions {
+        cwd,
+        budget: budget.unwrap_or(config.brief.budget),
+        recent_days: config.brief.recent_days,
+    };
+    print!("{}", kvault::brief::run(&store, &opts)?);
     Ok(())
 }
 

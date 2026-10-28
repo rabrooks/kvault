@@ -7,7 +7,6 @@ use std::path::PathBuf;
 pub enum Milestone {
     M1Index,
     M2Search,
-    M3Recall,
     M4Hooks,
     M5Graph,
     M6Mcp,
@@ -18,7 +17,6 @@ impl std::fmt::Display for Milestone {
         let s = match self {
             Self::M1Index => "M1 (index)",
             Self::M2Search => "M2 (search)",
-            Self::M3Recall => "M3 (recall/brief)",
             Self::M4Hooks => "M4 (hooks/capture)",
             Self::M5Graph => "M5 (links)",
             Self::M6Mcp => "M6 (mcp)",
