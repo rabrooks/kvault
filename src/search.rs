@@ -18,7 +18,9 @@
 //! stream: a chunk matching an excluded unit is never a candidate, and an
 //! excluded tag removes the document.
 //!
-//! Fusion is reciprocal rank fusion (`k = 60`), then a bounded authority
+//! Fusion is reciprocal rank fusion (`k = 60`). A chunk of a memory root's
+//! `MEMORY.md` is then capped just below the best fact file it links to
+//! that is also a candidate (see [`INDEX_FILE`]). Then comes a bounded authority
 //! multiplier from the root weight, `pinned` frontmatter, and the root's
 //! demotion globs (`archive/` by default). Results are one
 //! chunk per document unless `per_chunk` is set.
@@ -49,6 +51,22 @@ const AUTHORITY_MAX: f64 = 1.15;
 /// How much of `roots.weight - 1` reaches the multiplier.
 const AUTHORITY_DAMPING: f64 = 0.25;
 const PINNED_BONUS: f64 = 1.05;
+/// A memory root's index file: one pointer line per fact file, each with a
+/// hook that repeats the fact's vocabulary. A chunk of it holds the union of
+/// a dozen facts' terms, so it matches nearly any query (often every term,
+/// which earns the 2.0-weighted strict stream) while the answer is in the
+/// linked file. A ranking signal that large cannot be corrected inside the
+/// authority band, so the rule is structural instead: a pointer line never
+/// outranks its target. Only links on lines that contain a query term
+/// count, since one chunk points at a dozen facts and an unrelated one can
+/// be a weak candidate. A chunk whose matching lines link to a candidate is
+/// capped just below the best of them; otherwise it keeps its score,
+/// because it may be the only route to the fact.
+pub const INDEX_FILE: &str = "MEMORY.md";
+/// A capped pointer's fused score as a fraction of its target's. Pointer
+/// and target share a root and so an authority, so any ratio below 1 keeps
+/// the pointer directly beneath the target.
+const INDEX_CAP_RATIO: f64 = 0.99;
 /// Words at least this long are prefix-matched (`word*`).
 const PREFIX_MIN_LEN: usize = 3;
 /// Sibling chunk ids listed per document hit.
@@ -427,6 +445,19 @@ pub struct Explain {
     /// glob matched this document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demoted: Option<f64>,
+    /// Set when this is an index (`MEMORY.md`) chunk capped below a linked
+    /// candidate; `rrf` is the capped value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_cap: Option<IndexCap>,
+}
+
+/// Why an index chunk scored below its own stream ranks.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IndexCap {
+    /// Short id of the linked chunk it was capped below.
+    pub below: String,
+    /// The fused score before the cap.
+    pub rrf_before: f64,
 }
 
 /// A ranked hit at chunk granularity, with enough document context to print.
@@ -622,6 +653,7 @@ pub fn run(store: &Store, query: &Query, opts: &SearchOptions) -> Result<SearchR
 
     let mut fused = fuse(&streams);
     let candidates = fused.len();
+    cap_index_pointers(store, query, &mut fused)?;
     fused.sort_by(|a, b| {
         b.rrf
             .partial_cmp(&a.rrf)
@@ -905,6 +937,8 @@ struct Fused {
     streams: Vec<StreamRank>,
     /// Lower-ranked chunks of the same document, best first.
     siblings: Vec<i64>,
+    /// For a capped index chunk: the target chunk and the score before.
+    cap: Option<(i64, f64)>,
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -920,6 +954,7 @@ fn fuse(streams: &[Stream]) -> Vec<Fused> {
                 rrf: 0.0,
                 streams: Vec::new(),
                 siblings: Vec::new(),
+                cap: None,
             });
             entry.rrf += contribution;
             entry.streams.push(StreamRank {
@@ -931,6 +966,107 @@ fn fuse(streams: &[Stream]) -> Vec<Fused> {
         }
     }
     by_chunk.into_values().collect()
+}
+
+/// Cap each [`INDEX_FILE`] chunk below the best candidate document linked
+/// from its query-matching lines. Runs before collapse and pruning, on
+/// fused scores, so the pruning bound stays sound; pointer and target share
+/// a root, so the order survives the authority multiplier.
+fn cap_index_pointers(store: &Store, query: &Query, fused: &mut [Fused]) -> Result<()> {
+    if fused.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = fused.iter().map(|f| f.chunk_id).collect();
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT c.id, l.to_doc_id, l.line, d.id, r.path, d.rel_path
+         FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
+         JOIN links l ON l.from_doc_id = c.doc_id AND l.line BETWEEN c.start_line AND c.end_line
+         WHERE c.id IN ({placeholders}) AND r.kind = 'memory' AND d.rel_path = '{INDEX_FILE}'
+           AND l.to_doc_id IS NOT NULL AND l.to_doc_id != c.doc_id"
+    );
+    // Lines of each index file, read once; `None` when unreadable, in which
+    // case every link in the chunk counts.
+    let mut files: HashMap<i64, Option<Vec<String>>> = HashMap::new();
+    let mut targets: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut stmt = store.conn().prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (chunk, target, line, doc, root, rel) = row?;
+        let lines = files.entry(doc).or_insert_with(|| {
+            std::fs::read_to_string(Path::new(&root).join(&rel))
+                .ok()
+                .map(|t| t.lines().map(str::to_owned).collect())
+        });
+        let matches = match lines {
+            Some(lines) => usize::try_from(line - 1)
+                .ok()
+                .and_then(|i| lines.get(i))
+                .is_some_and(|l| line_matches(query, l)),
+            None => true,
+        };
+        if matches {
+            targets.entry(chunk).or_default().push(target);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    // Best chunk per candidate document, by fused score.
+    let mut best: HashMap<i64, (f64, i64)> = HashMap::new();
+    for f in fused.iter() {
+        let e = best.entry(f.doc_id).or_insert((f.rrf, f.chunk_id));
+        if f.rrf > e.0 {
+            *e = (f.rrf, f.chunk_id);
+        }
+    }
+    for f in fused.iter_mut() {
+        let Some(docs) = targets.get(&f.chunk_id) else {
+            continue;
+        };
+        let target = docs
+            .iter()
+            .filter_map(|d| best.get(d))
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(&(rrf, chunk)) = target {
+            let cap = rrf * INDEX_CAP_RATIO;
+            if f.rrf > cap {
+                f.cap = Some((chunk, f.rrf));
+                f.rrf = cap;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a line contains any positive unit of the query, compared on the
+/// same lowercase alphanumeric runs the tokenizer indexes. A query with no
+/// positive units (filters only) matches every line.
+fn line_matches(query: &Query, line: &str) -> bool {
+    if query.positive.is_empty() {
+        return true;
+    }
+    let runs = alnum_runs(line);
+    let term =
+        |word: &str, prefix: bool, run: &str| run == word || (prefix && run.starts_with(word));
+    query.positive.iter().any(|u| match u {
+        Unit::Term { word, prefix } => runs.iter().any(|r| term(word, *prefix, r)),
+        Unit::Phrase(ws) => {
+            !ws.is_empty()
+                && runs
+                    .windows(ws.len())
+                    .any(|w| w.iter().zip(ws).all(|(a, b)| a == b))
+        }
+    })
 }
 
 /// Keep the best chunk per document; the rest become its siblings. Done
@@ -1037,6 +1173,12 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
     let mut by_chunk: HashMap<i64, Hit> = rows
         .map(|r| r.map(|h| (h.chunk.chunk_id, h)))
         .collect::<std::result::Result<_, _>>()?;
+    // Hits leave `by_chunk` as they are placed, and a capped index chunk's
+    // target always places first, so keep its short id aside.
+    let short_ids: HashMap<i64, String> = by_chunk
+        .iter()
+        .map(|(id, h)| (*id, h.chunk.id.clone()))
+        .collect();
     let mut out = Vec::with_capacity(fused.len());
     for f in fused {
         let Some(mut hit) = by_chunk.remove(&f.chunk_id) else {
@@ -1049,6 +1191,12 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
             rrf: f.rrf,
             authority: auth,
             demoted: hit.explain.demoted,
+            index_cap: f.cap.and_then(|(target, rrf_before)| {
+                short_ids.get(&target).map(|below| IndexCap {
+                    below: below.clone(),
+                    rrf_before,
+                })
+            }),
         };
         hit.siblings = f
             .siblings

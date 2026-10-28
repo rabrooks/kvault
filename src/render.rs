@@ -157,8 +157,19 @@ fn explain_line(h: &Hit) -> String {
         .demoted
         .map(|f| format!(" (demoted ×{f:.2})"))
         .unwrap_or_default();
+    let capped = h
+        .explain
+        .index_cap
+        .as_ref()
+        .map(|c| {
+            format!(
+                " (index, capped from {:.4} below #{})",
+                c.rrf_before, c.below
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{}  rrf {:.4} × auth {:.2}{demoted} = {:.4}",
+        "{}  rrf {:.4}{capped} × auth {:.2}{demoted} = {:.4}",
         parts.join("  "),
         h.explain.rrf,
         h.explain.authority,
