@@ -22,10 +22,12 @@
 //! | [`pack`] | token-budget packer: tiers, measure-and-drop, text trimming |
 //! | [`recall`] | `search` packed into a budget, what agents call |
 //! | [`brief`] | session-start context block for a working directory |
+//! | [`add`] | write a note into a root and index it |
 //! | [`capture`] | session-note writer used by Stop/`PreCompact` hooks |
 //! | [`hooks`] | Claude Code hook entry points |
 //! | [`cli`] | clap command definitions |
 
+pub mod add;
 pub mod bench;
 pub mod brief;
 pub mod capture;

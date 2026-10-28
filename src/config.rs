@@ -20,6 +20,9 @@ pub const KVAULT_CONFIG_ENV: &str = "KVAULT_CONFIG";
 /// Environment variable that overrides the index database location.
 pub const KVAULT_DB_ENV: &str = "KVAULT_DB";
 
+/// Environment variable that overrides the hook log location.
+pub const KVAULT_LOG_ENV: &str = "KVAULT_LOG";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -144,6 +147,16 @@ impl Config {
             return Some(PathBuf::from(p));
         }
         xdg_dir("XDG_DATA_HOME", ".local/share").map(|d| d.join("kvault").join("index.db"))
+    }
+
+    /// Where hooks append failures: `KVAULT_LOG`, else
+    /// `$XDG_STATE_HOME/kvault/hooks.log`, else `~/.local/state/kvault/hooks.log`.
+    #[must_use]
+    pub fn hook_log_path() -> Option<PathBuf> {
+        if let Ok(p) = env::var(KVAULT_LOG_ENV) {
+            return Some(PathBuf::from(p));
+        }
+        xdg_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("kvault").join("hooks.log"))
     }
 
     /// The roots `kvault init` writes when none are configured.

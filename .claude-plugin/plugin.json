@@ -1,0 +1,9 @@
+{
+  "name": "kvault",
+  "version": "0.2.0",
+  "description": "Local-first knowledge index for coding agents: session-start brief, session capture, and a skill for searching and saving notes across projects.",
+  "author": { "name": "Aaron Brooks" },
+  "repository": "https://github.com/rabrooks/kvault",
+  "license": "MIT",
+  "keywords": ["memory", "notes", "search", "knowledge"]
+}

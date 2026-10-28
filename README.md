@@ -16,8 +16,8 @@ real use. Commands land milestone by milestone:
 | M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | done |
 | M2 | `search`, `get`, `--explain`, `bench` | done |
 | M3 | `recall` budget packer, `brief` | done |
-| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | next |
-| M5 | links stream, `links` | |
+| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | done |
+| M5 | links stream, `links` | next |
 | M6 | MCP stdio adapter (`--features mcp`) | |
 
 Commands that are not implemented yet exit with code 3 and name their milestone.
@@ -145,6 +145,52 @@ The project is the nearest ancestor directory whose name matches a configured ro
 project. The block fits the budget (2000 tokens by default) and stays under 8,000 characters
 so Claude Code does not swap it for a file preview; the header line is byte-stable across
 runs except the counts and a coarse index age at its end.
+
+## Claude Code integration
+
+The repository is also a Claude Code plugin: `hooks/hooks.json`, `skills/kvault/SKILL.md`
+and `.claude-plugin/plugin.json`. With the binary on `PATH`:
+
+```bash
+claude --plugin-dir ~/Projects/kvault        # try it for one session
+```
+
+or copy the three hook entries into `~/.claude/settings.json` and the skill directory into
+`~/.claude/skills/`. The hooks:
+
+| Event | Command | What it does |
+|---|---|---|
+| `SessionStart` (`startup`, `clear`, `compact`; not `resume` or `fork`) | `kvault hook session-start` | incremental index, then injects `kvault brief` for the session's `cwd` as `additionalContext` |
+| `Stop` | `kvault hook stop` | writes or rewrites the session note, indexes it |
+| `PreCompact` | `kvault hook pre-compact` | same writer, so a compaction never loses the note |
+
+Hooks read Claude Code's JSON on stdin, print JSON on stdout and always exit 0. A failure
+prints `{}` and appends one line to `~/.local/state/kvault/hooks.log` (`KVAULT_LOG`
+overrides), so a week of use can be audited with one `cat`. Stop and `PreCompact` make no
+LLM calls and read at most 1 MB of the transcript (the first 128 KB and the last 896 KB).
+
+The session note is `<project>/notes/sessions/<date>-<session8>.md`, one file per session
+rewritten on every stop, where `<project>` is the nearest ancestor of `cwd` with a `.git`.
+When the project has no `notes/` dir it goes to `[capture] fallback_dir` (default
+`~/.local/share/kvault/sessions/<project>/`), which is only indexed if you add it as a
+root. The note carries `kind: session`, the first prompt (its first line is the title, so
+the brief's recent list reads as a log), the last assistant message, and the files the
+transcript shows were read or edited. `<private>…</private>` spans are dropped and
+credential-shaped tokens (PEM blocks, `Bearer x`, AWS, GitHub, Slack, OpenAI, Anthropic
+and Google key prefixes) are replaced with `[redacted]`. Promoting a session note into a
+durable note is the agent's job, through the skill and `kvault add`.
+
+```
+kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P | --root DIR] [--file F]
+```
+
+writes `<slug>.md` with frontmatter into the project's notes root (the memory root when
+that is the only one; `--root` to choose) and indexes it. The body comes from `--file` or
+stdin. An existing file is replaced only when `--expected-hash` matches the BLAKE3 the
+previous `add` printed (a prefix of eight or more hex digits is enough), so two agents
+cannot overwrite each other unknowingly. In a Claude Code memory root the file uses that
+loader's `name`/`description`/`metadata.type` frontmatter and a pointer line is appended to
+`MEMORY.md`.
 
 ## CLI (v0 surface)
 

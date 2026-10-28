@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use kvault::add::AddOptions;
 use kvault::bench::BenchOptions;
 use kvault::brief::BriefOptions;
 use kvault::cli::{Cli, Command, RecallFormat, SearchArgs};
@@ -13,7 +14,7 @@ use kvault::list::{self, ListFilter};
 use kvault::recall::RecallOptions;
 use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
-use kvault::{get, render, roots};
+use kvault::{get, hooks, render, roots};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -72,8 +73,37 @@ fn run(command: Command) -> kvault::Result<()> {
             format,
         } => recall(&query, budget, project, format),
         Command::Brief { cwd, budget } => brief(cwd.as_deref(), budget),
-        Command::Add { .. } => not_yet("add", Milestone::M4Hooks),
-        Command::Hook { .. } => not_yet("hook", Milestone::M4Hooks),
+        Command::Add {
+            title,
+            kind,
+            project,
+            tags,
+            root,
+            file,
+            expected_hash,
+        } => add(
+            &AddOptions {
+                title,
+                kind,
+                project,
+                tags: tags
+                    .map(|t| {
+                        t.split(',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                root: root.as_deref().map(expand_tilde),
+                expected_hash,
+                cwd: std::env::current_dir()?,
+            },
+            file.as_deref(),
+        ),
+        Command::Hook { event } => {
+            println!("{}", hooks::run(event));
+            Ok(())
+        }
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
         Command::Bench {
             file,
@@ -187,6 +217,33 @@ fn recall(
         eprintln!("budget {budget} is too small for any output");
     }
     print!("{}", result.text);
+    Ok(())
+}
+
+fn add(opts: &AddOptions, file: Option<&str>) -> kvault::Result<()> {
+    let body = if let Some(f) = file {
+        std::fs::read_to_string(expand_tilde(f))?
+    } else {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut s)?;
+        s
+    };
+    let config = Config::load()?;
+    let mut store = open_store()?;
+    let added = kvault::add::run(&config, &mut store, opts, &body)?;
+    println!(
+        "{}  {}",
+        if added.replaced {
+            "replaced"
+        } else {
+            "wrote   "
+        },
+        added.path.display()
+    );
+    println!("blake3    {}", added.hash);
+    if !added.indexed {
+        println!("not indexed: the file is outside every configured root");
+    }
     Ok(())
 }
 

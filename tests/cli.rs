@@ -79,11 +79,23 @@ fn unimplemented_commands_exit_3_with_milestone() {
         .assert()
         .code(3)
         .stderr(predicate::str::contains("M5"));
-    kvault()
-        .args(["hook", "session-start"])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("M4"));
+}
+
+#[test]
+fn hooks_exit_zero_even_when_nothing_is_configured() {
+    let tmp = tempfile::tempdir().unwrap();
+    for event in ["session-start", "stop", "pre-compact"] {
+        kvault()
+            .env("KVAULT_DB", tmp.path().join("index.db"))
+            .env("KVAULT_LOG", tmp.path().join("hooks.log"))
+            .args(["hook", event])
+            .write_stdin("{}")
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("{"));
+    }
+    // Nothing configured is not an error worth a log line.
+    assert!(!tmp.path().join("hooks.log").exists());
 }
 
 #[test]

@@ -88,6 +88,45 @@ impl std::fmt::Display for IndexReport {
     }
 }
 
+/// Re-index only the configured root that contains `path` (what `add` and
+/// the capture hooks do after writing one file). Returns `false`, having
+/// done nothing, when the file is outside every root.
+///
+/// # Errors
+/// Returns an error if the database cannot be written.
+pub fn reindex_root_containing(config: &Config, store: &mut Store, path: &Path) -> Result<bool> {
+    let file = canonical_file(path);
+    let root = roots::expand(&config.roots)
+        .into_iter()
+        .find(|r| file.starts_with(canonical_dir(&r.path)));
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    run(
+        config,
+        store,
+        &IndexOptions {
+            full: false,
+            quiet: true,
+            only_root: Some(root.path),
+        },
+    )?;
+    Ok(true)
+}
+
+fn canonical_dir(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Canonicalize the directory part only, so a file that does not exist yet
+/// still compares equal to a root reached through a symlink.
+fn canonical_file(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => canonical_dir(dir).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Run an incremental index over all configured roots.
 ///
 /// # Errors
