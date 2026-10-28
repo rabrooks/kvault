@@ -16,20 +16,26 @@
 //! | [`index`] | walk roots, hash, upsert docs/chunks |
 //! | [`list`] | document listing with filters |
 //! | [`search`] | query parser, streams, rank fusion, explain |
+//! | [`render`] | output formats for `search` |
+//! | [`get`] | chunk and document text by id, path, or line window |
+//! | [`bench`] | retrieval quality and latency over a query file |
 //! | [`pack`] | token-budget packer for `recall` and `brief` |
 //! | [`capture`] | session-note writer used by Stop/`PreCompact` hooks |
 //! | [`hooks`] | Claude Code hook entry points |
 //! | [`cli`] | clap command definitions |
 
+pub mod bench;
 pub mod capture;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod get;
 pub mod hooks;
 pub mod index;
 pub mod list;
 pub mod markdown;
 pub mod pack;
+pub mod render;
 pub mod roots;
 pub mod search;
 pub mod store;

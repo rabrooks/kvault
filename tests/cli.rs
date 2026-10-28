@@ -75,10 +75,10 @@ fn status_opens_db_when_present() {
 #[test]
 fn unimplemented_commands_exit_3_with_milestone() {
     kvault()
-        .args(["search", "anything"])
+        .args(["links", "anything"])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("M2"));
+        .stderr(predicate::str::contains("M5"));
     kvault()
         .args(["recall", "anything"])
         .assert()

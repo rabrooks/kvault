@@ -104,8 +104,22 @@ pub enum Command {
     },
     /// Roots, counts, index age, database size
     Status,
-    /// Run a retrieval benchmark file
-    Bench { file: String },
+    /// Run a retrieval benchmark file (JSON lines: query, expected, note)
+    Bench {
+        file: String,
+        /// Also score a case-insensitive grep over the same files
+        #[arg(long)]
+        baseline: bool,
+        /// Fail (exit 1) if hit@5 falls below this
+        #[arg(long)]
+        min_hit5: Option<f64>,
+        /// Results considered per query
+        #[arg(long, short = 'n', default_value_t = 10)]
+        limit: usize,
+        /// List every miss with the top paths returned
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Claude Code hook entry points (stdin `JSON` → stdout `JSON`, always exit 0)
     Hook {
         #[arg(value_enum)]

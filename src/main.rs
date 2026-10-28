@@ -3,13 +3,15 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use kvault::cli::{Cli, Command};
+use kvault::bench::BenchOptions;
+use kvault::cli::{Cli, Command, SearchArgs};
 use kvault::config::{Config, expand_tilde};
 use kvault::error::{Error, Milestone};
 use kvault::index::{self, IndexOptions};
 use kvault::list::{self, ListFilter};
-use kvault::roots;
+use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
+use kvault::{get, render, roots};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -54,14 +56,25 @@ fn run(command: Command) -> kvault::Result<()> {
             recent_days: recent,
             limit,
         }),
-        Command::Search(args) => kvault::search::run(&args.query).map(|_| ()),
-        Command::Get { .. } => not_yet("get", Milestone::M2Search),
+        Command::Search(args) => search(&args),
+        Command::Get { target, doc } => {
+            let store = open_store()?;
+            let out = get::run(&store, &get::Target::parse(&target), doc)?;
+            print!("{out}");
+            Ok(())
+        }
         Command::Recall { .. } => not_yet("recall", Milestone::M3Recall),
         Command::Brief { .. } => not_yet("brief", Milestone::M3Recall),
         Command::Add { .. } => not_yet("add", Milestone::M4Hooks),
         Command::Hook { .. } => not_yet("hook", Milestone::M4Hooks),
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
-        Command::Bench { .. } => not_yet("bench", Milestone::M2Search),
+        Command::Bench {
+            file,
+            baseline,
+            min_hit5,
+            limit,
+            verbose,
+        } => bench(&file, baseline, min_hit5, limit, verbose),
         #[cfg(feature = "mcp")]
         Command::Serve => not_yet("serve", Milestone::M6Mcp),
     }
@@ -126,6 +139,46 @@ fn init(force: bool) -> kvault::Result<()> {
     std::fs::write(&path, config.to_toml()?)?;
     println!("wrote  {}", path.display());
     run_index(&IndexOptions::default())
+}
+
+fn search(args: &SearchArgs) -> kvault::Result<()> {
+    let store = open_store()?;
+    let query = Query::parse(&args.query);
+    let opts = SearchOptions {
+        limit: args.limit,
+        project: args.project.clone(),
+        root: args.root.as_deref().map(expand_tilde),
+        kind: args.kind.clone(),
+        tags: args.tag.clone(),
+        path: args.path.clone(),
+        since: args.since.clone(),
+        per_chunk: args.per_chunk,
+    };
+    let result = kvault::search::run(&store, &query, &opts)?;
+    print!("{}", render::render(&result, args.format, args.explain)?);
+    Ok(())
+}
+
+fn bench(
+    file: &str,
+    baseline: bool,
+    min_hit5: Option<f64>,
+    limit: usize,
+    verbose: bool,
+) -> kvault::Result<()> {
+    let store = open_store()?;
+    let cases = kvault::bench::load(&expand_tilde(file))?;
+    let report = kvault::bench::run(&store, &cases, &BenchOptions { limit, baseline })?;
+    print!("{}", report.render(verbose));
+    if let Some(min) = min_hit5
+        && report.kvault.metrics.hit5 < min
+    {
+        return Err(Error::Other(anyhow::anyhow!(
+            "hit@5 {:.2} is below the required {min:.2}",
+            report.kvault.metrics.hit5
+        )));
+    }
+    Ok(())
 }
 
 fn list_docs(filter: &ListFilter) -> kvault::Result<()> {

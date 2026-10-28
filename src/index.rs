@@ -35,9 +35,10 @@ const RACY_WINDOW_NS: i64 = 2_000_000_000;
 pub const TOKENIZER_ID: &str = "bytes36";
 
 /// Bump whenever `markdown::parse` output changes shape (chunking, links,
-/// tags, title rules). Each root records the version it was parsed with; a
-/// mismatch forces every file under it to be re-parsed on the next run.
-pub const PARSER_VERSION: &str = "1";
+/// tags, title rules) or the chunk id derivation changes. Each root records
+/// the version it was parsed with; a mismatch forces every file under it to
+/// be re-parsed on the next run.
+pub const PARSER_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
@@ -353,7 +354,7 @@ fn now_ns() -> i64 {
     system_time_ns(SystemTime::now())
 }
 
-fn system_time_ns(t: SystemTime) -> i64 {
+pub(crate) fn system_time_ns(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
@@ -501,7 +502,7 @@ fn replace_doc(
     )?;
     for c in &parsed.chunks {
         let body = &text[c.byte_start..c.byte_end];
-        let chunk_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+        let chunk_hash = chunk_hash(&file.abs_path.to_string_lossy(), &c.heading_path, body);
         ins_chunk.execute(params![
             id,
             c.ordinal,
@@ -546,6 +547,19 @@ fn replace_doc(
         ins_obs.execute(params![id, o.line, o.category, o.text])?;
     }
     Ok(())
+}
+
+/// Chunk identity: the file's absolute path and heading path go into the
+/// hash so identical sections in different notes (templates, boilerplate)
+/// get distinct ids. `search` prints a prefix of this; `get` resolves it.
+fn chunk_hash(abs_path: &str, heading_path: &str, body: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(abs_path.as_bytes());
+    h.update(b"\0");
+    h.update(heading_path.as_bytes());
+    h.update(b"\0");
+    h.update(body.as_bytes());
+    h.finalize().to_hex().to_string()
 }
 
 fn clear_doc_children(tx: &Transaction<'_>, id: i64) -> Result<()> {

@@ -14,8 +14,8 @@ real use. Commands land milestone by milestone:
 |---|---|---|
 | M0 | toolchain pin, module tree, schema v1, `status`, CI | done |
 | M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | done |
-| M2 | `search`, `get`, `--explain`, `bench` | next |
-| M3 | `recall` budget packer, `brief` | |
+| M2 | `search`, `get`, `--explain`, `bench` | done |
+| M3 | `recall` budget packer, `brief` | next |
 | M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | |
 | M5 | links stream, `links` | |
 | M6 | MCP stdio adapter (`--features mcp`) | |
@@ -86,6 +86,40 @@ lifted, everything else is kept as filterable metadata. `[[wikilinks]]`, relativ
 `- verb [[Target]]` relations, and `- [category] text #tag` observation lines are extracted.
 
 On a corpus of 226 files / 1.3 MB: cold index ~200 ms, warm ~4 ms.
+
+## Searching
+
+The agent writes the query; kvault does no expansion of its own.
+
+```
+kvault search "lambda cold start"            # bare words: any may match, each prefix-matched
+kvault search '"cold start" -timeout'        # quoted = phrase, -word excludes
+kvault search 'tag:devops symplr'            # inline tag filter; -tag:x excludes
+kvault search 'tag:devops'                   # filters alone list matching docs, newest first
+kvault search 'lex: title:lambda NEAR(cold start)'   # raw FTS5 syntax passed through
+kvault search ... --project vllm --kind memory --path 'research/*' --since 30d
+kvault search ... --format cli|json|md|paths|ids --explain --per-chunk -n 20
+```
+
+Four streams run independently and are fused by reciprocal rank fusion (k=60): all-terms
+FTS (weight 2), any-term FTS, exact title match, and tag match. Exclusions (`-word`, `-tag:x`,
+`NOT` inside `lex:`) apply to every stream. A small authority multiplier (0.85–1.15) from the
+root weight and `pinned: true` breaks ties. Results are one chunk per document with the other
+matching chunks listed as siblings. `--explain` prints each hit's per-stream rank and raw
+score, its fused score, and per-stream timings.
+
+Hits carry an eight-hex-digit id, a prefix of a BLAKE3 over the file path, heading path and
+chunk text, so it is stable until one of those changes and identical boilerplate sections in
+different files still get different ids. `kvault get <id>` prints the chunk with line numbers;
+`kvault get <path>[:from[:count]]` prints a line window; `--doc` prints the whole file. Paths
+are accepted as printed by `search`, absolute, or as any unique suffix. If a file changed
+since it was indexed the output is marked `[stale]`.
+
+`kvault bench <queries.jsonl> [--baseline] [-v] [--min-hit5 F]` scores hit@1/3/5, section
+hit@5, MRR and latency over a query file (`{"query", "expected": ["path#heading"]}` per line),
+optionally against a case-insensitive grep over the same files. `--min-hit5` makes it a CI
+gate. On a 44-query bench over the real corpus (release build): kvault hit@1 0.95, hit@5 1.00,
+MRR 0.98, p50 1 ms; grep hit@1 0.59, hit@5 0.98, MRR 0.75, p50 10 ms.
 
 ## CLI (v0 surface)
 
