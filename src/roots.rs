@@ -151,7 +151,8 @@ pub fn derive_project(dir: &Path, from: ProjectFrom) -> Option<String> {
     }
 }
 
-/// Claude Code's memory slug is the absolute path with `/` replaced by `-`.
+/// Claude Code's memory slug is the absolute path with every character that
+/// is not an ASCII letter or digit replaced by `-`.
 /// Map it to a project name relative to the home directory:
 /// `-Users-abrooks-Projects-work-mas` → `work-mas`,
 /// `-Users-abrooks-dotfiles-nvim` → `dotfiles-nvim`,
@@ -181,9 +182,12 @@ fn claude_slug_project_with_home(slug: &str, home_slug: Option<&str>) -> Option<
     }
 }
 
-/// `/Users/abrooks` → `-Users-abrooks` (Claude Code's directory slug).
+/// `/Users/karl.meiser` → `-Users-karl-meiser` (Claude Code's directory slug).
 fn path_slug(path: &Path) -> String {
-    path.to_string_lossy().replace(['/', '\\'], "-")
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -203,6 +207,33 @@ mod tests {
             Some("Users-x-foo")
         );
         assert_eq!(claude_slug_project("-"), None);
+    }
+
+    #[test]
+    fn path_slug_replaces_non_alphanumerics() {
+        assert_eq!(
+            path_slug(Path::new("/Users/karl.meiser")),
+            "-Users-karl-meiser"
+        );
+        assert_eq!(
+            path_slug(Path::new("/Users/karl.meiser/.claude")),
+            "-Users-karl-meiser--claude"
+        );
+        assert_eq!(path_slug(Path::new("/a/field_ops")), "-a-field-ops");
+    }
+
+    #[test]
+    fn claude_slug_strips_dotted_home() {
+        let home = path_slug(Path::new("/Users/karl.meiser"));
+        assert_eq!(
+            claude_slug_project_with_home("-Users-karl-meiser-data-pipeline", Some(&home))
+                .as_deref(),
+            Some("data-pipeline")
+        );
+        assert_eq!(
+            claude_slug_project_with_home("-Users-karl-meiser", Some(&home)),
+            None
+        );
     }
 
     #[test]
