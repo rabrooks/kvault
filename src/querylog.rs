@@ -1,13 +1,15 @@
-//! The query log: one `JSON` line per `search` or `recall`, and one per
-//! result the session then used.
+//! The query log: one `JSON` line per `search` or `recall`, per session
+//! brief injected, per session that completed a turn, and per listed note
+//! the session then used.
 //!
-//! It is the evidence for whether retrieval helps: which queries are asked,
-//! what came back, and whether any of it was opened afterwards. It lives
+//! It is the evidence for whether retrieval helps: how many sessions there
+//! were, which of them searched, what came back and at what cost, and
+//! whether any of it, or anything the brief listed, was opened afterwards. It lives
 //! beside the hook log rather than in the index, which is derived and may be
 //! deleted at any time. Writing it is best effort; a search never fails
 //! because its log line could not be written.
 //!
-//! A result counts as used when, after the query and in the same session,
+//! A result counts as used when, after it was listed and in the same session,
 //! it was fetched with `kvault get`, its file was read or edited by a file
 //! tool, its path appeared in a shell command, or the assistant's text
 //! named it. Use lines are written by the Stop and `PreCompact` hooks from
@@ -50,12 +52,73 @@ pub struct LoggedHit {
 pub enum Event {
     Query(QueryEvent),
     Use(UseEvent),
+    Brief(BriefEvent),
+    Session(SessionEvent),
+}
+
+impl Event {
+    /// When the event was recorded.
+    #[must_use]
+    pub fn at(&self) -> &str {
+        match self {
+            Self::Query(e) => &e.at,
+            Self::Use(e) => &e.at,
+            Self::Brief(e) => &e.at,
+            Self::Session(e) => &e.at,
+        }
+    }
+}
+
+/// The version stamped on new lines, so results from different builds are
+/// not pooled blindly.
+#[must_use]
+pub fn version() -> Option<String> {
+    Some(env!("CARGO_PKG_VERSION").to_owned())
+}
+
+/// A session brief was injected at `SessionStart`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BriefEvent {
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub session: String,
+    /// `startup`, `clear` or `compact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Tokens of the brief, by the index's counter.
+    pub tokens: usize,
+    /// Size of the index it was built from.
+    pub docs: i64,
+    pub chunks: i64,
+    pub roots: i64,
+    /// The notes the brief listed.
+    pub hits: Vec<LoggedHit>,
+}
+
+/// A session completed a turn. Written once per session, by the first Stop
+/// or `PreCompact` hook, so sessions can be counted whether or not they
+/// searched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryEvent {
     /// When the query ran (RFC 3339, UTC).
     pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// `search` or `recall`.
     pub command: String,
     pub query: String,
@@ -71,6 +134,19 @@ pub struct QueryEvent {
     pub session: Option<String>,
     /// Hits found, which may exceed the hits listed.
     pub total: usize,
+    /// `recall` only: the reply was a weak match, references only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub weak: bool,
+    /// `recall` only: the best share of the query in the top hits, in
+    /// hundredths, when that is meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_pct: Option<u32>,
+    /// `recall` only: tokens printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<usize>,
+    /// Milliseconds the command spent searching and packing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
     /// The hits shown, best first, at most [`MAX_HITS`].
     pub hits: Vec<LoggedHit>,
 }
@@ -80,10 +156,21 @@ pub struct UseEvent {
     /// When the hook recorded it.
     pub at: String,
     pub session: String,
-    /// `at` of the query this result came from.
+    /// `at` of the query or brief that listed the note.
     pub query_at: String,
+    /// What listed it.
+    #[serde(default)]
+    pub from: Source,
     pub id: String,
     pub how: How,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    #[default]
+    Query,
+    Brief,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -106,6 +193,11 @@ pub struct NewQuery<'a> {
     pub project: Option<&'a str>,
     pub budget: Option<usize>,
     pub total: usize,
+    pub weak: bool,
+    /// In `[0, 1]`.
+    pub coverage: Option<f64>,
+    pub tokens: Option<usize>,
+    pub elapsed: std::time::Duration,
     pub hits: Vec<LoggedHit>,
 }
 
@@ -120,8 +212,13 @@ pub fn record(config: &Config, q: NewQuery<'_>) {
     };
     let mut hits = q.hits;
     hits.truncate(MAX_HITS);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let coverage_pct = q
+        .coverage
+        .map(|c| (c.clamp(0.0, 1.0) * 100.0).round() as u32);
     let event = Event::Query(QueryEvent {
         at: jiff::Timestamp::now().to_string(),
+        version: version(),
         command: q.command.to_owned(),
         query: q.query.to_owned(),
         project: q.project.map(str::to_owned),
@@ -129,9 +226,26 @@ pub fn record(config: &Config, q: NewQuery<'_>) {
         cwd: std::env::current_dir().ok(),
         session: std::env::var(SESSION_ENV).ok().filter(|s| !s.is_empty()),
         total: q.total,
+        weak: q.weak,
+        coverage_pct,
+        tokens: q.tokens,
+        ms: Some(u64::try_from(q.elapsed.as_millis()).unwrap_or(u64::MAX)),
         hits,
     });
     let _ = append(&path, &[event]);
+}
+
+/// Append a brief injection to the log at the configured location, if
+/// enabled. Failures are ignored.
+pub fn record_brief(config: &Config, mut event: BriefEvent) {
+    if !config.query_log.enabled || event.session.is_empty() {
+        return;
+    }
+    let Some(path) = Config::query_log_path() else {
+        return;
+    };
+    event.hits.truncate(MAX_HITS);
+    let _ = append(&path, &[Event::Brief(event)]);
 }
 
 /// Append events, one line each, in a single write so concurrent writers
@@ -175,13 +289,19 @@ pub fn read(path: &Path) -> Result<Vec<Event>> {
         .collect())
 }
 
-/// Record which results of this session's queries the transcript shows
-/// were used. Returns how many use lines were added; none are repeated
-/// when the hook runs again on a longer transcript.
+/// Record that this session completed a turn, once, and which notes its
+/// queries and briefs listed that the transcript shows were then used.
+/// Returns how many lines were added; none are repeated when the hook runs
+/// again on a longer transcript.
 ///
 /// # Errors
 /// Returns an error if the log cannot be read or written.
-pub fn mark_used(path: &Path, session: &str, transcript: &Transcript) -> Result<usize> {
+pub fn mark_used(
+    path: &Path,
+    session: &str,
+    cwd: Option<&Path>,
+    transcript: &Transcript,
+) -> Result<usize> {
     if session.is_empty() {
         return Ok(0);
     }
@@ -197,22 +317,41 @@ pub fn mark_used(path: &Path, session: &str, transcript: &Transcript) -> Result<
         .collect();
     let now = jiff::Timestamp::now().to_string();
     let mut new = Vec::new();
-    for q in events.iter().filter_map(|e| match e {
-        Event::Query(q) if q.session.as_deref() == Some(session) => Some(q),
+    if !events
+        .iter()
+        .any(|e| matches!(e, Event::Session(s) if s.session == session))
+    {
+        new.push(Event::Session(SessionEvent {
+            at: now.clone(),
+            version: version(),
+            session: session.to_owned(),
+            cwd: cwd.map(Path::to_path_buf),
+        }));
+    }
+    // (listed at, listed from where, by what, the notes)
+    let listings = events.iter().filter_map(|e| match e {
+        Event::Query(q) if q.session.as_deref() == Some(session) => {
+            Some((&q.at, q.cwd.as_deref(), Source::Query, &q.hits))
+        }
+        Event::Brief(b) if b.session == session => {
+            Some((&b.at, b.cwd.as_deref(), Source::Brief, &b.hits))
+        }
         _ => None,
-    }) {
+    });
+    for (at, listed_cwd, from, hits) in listings {
         let later: Vec<&Action> = transcript
             .actions
             .iter()
-            .filter(|a| is_after(a.at.as_deref(), &q.at))
+            .filter(|a| is_after(a.at.as_deref(), at))
             .collect();
-        for hit in &q.hits {
-            for how in uses(hit, q.cwd.as_deref(), &later) {
-                if !known.contains(&(q.at.as_str(), hit.id.as_str(), how)) {
+        for hit in hits {
+            for how in uses(hit, listed_cwd, &later) {
+                if !known.contains(&(at.as_str(), hit.id.as_str(), how)) {
                     new.push(Event::Use(UseEvent {
                         at: now.clone(),
                         session: session.to_owned(),
-                        query_at: q.at.clone(),
+                        query_at: at.clone(),
+                        from,
                         id: hit.id.clone(),
                         how,
                     }));
@@ -289,6 +428,7 @@ mod tests {
     fn query(at: &str, session: &str) -> Event {
         Event::Query(QueryEvent {
             at: at.to_owned(),
+            version: version(),
             command: "recall".to_owned(),
             query: "replica sku".to_owned(),
             project: None,
@@ -296,6 +436,10 @@ mod tests {
             cwd: Some(PathBuf::from("/work/mas")),
             session: Some(session.to_owned()),
             total: 2,
+            weak: false,
+            coverage_pct: Some(80),
+            tokens: Some(900),
+            ms: Some(4),
             hits: vec![
                 LoggedHit {
                     id: "aaaa1111".to_owned(),
@@ -325,7 +469,7 @@ mod tests {
             .into_iter()
             .filter_map(|e| match e {
                 Event::Use(u) => Some((u.id, u.how)),
-                Event::Query(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -375,7 +519,8 @@ mod tests {
             ],
             ..Transcript::default()
         };
-        assert_eq!(mark_used(&path, "s1", &t).unwrap(), 3);
+        // Three uses and the line that says the session happened.
+        assert_eq!(mark_used(&path, "s1", None, &t).unwrap(), 4);
         assert_eq!(
             uses_in(&path),
             vec![
@@ -385,14 +530,71 @@ mod tests {
             ]
         );
         // The hook runs again on every Stop.
-        assert_eq!(mark_used(&path, "s1", &t).unwrap(), 0);
+        assert_eq!(mark_used(&path, "s1", None, &t).unwrap(), 0);
         t.actions.push(action(
             "2026-11-20T10:01:00Z",
             ActionKind::File,
             "/work/mas/todo.md",
         ));
-        assert_eq!(mark_used(&path, "s1", &t).unwrap(), 1);
+        assert_eq!(mark_used(&path, "s1", None, &t).unwrap(), 1);
         assert_eq!(uses_in(&path).last().unwrap().1, How::File);
+    }
+
+    #[test]
+    fn a_note_the_brief_listed_is_credited_to_the_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queries.jsonl");
+        let brief = Event::Brief(BriefEvent {
+            at: "2026-11-20T10:00:00Z".to_owned(),
+            version: version(),
+            session: "s1".to_owned(),
+            source: Some("startup".to_owned()),
+            project: Some("mas".to_owned()),
+            cwd: Some(PathBuf::from("/work/mas")),
+            tokens: 300,
+            docs: 10,
+            chunks: 40,
+            roots: 2,
+            hits: vec![LoggedHit {
+                id: "cccc3333".to_owned(),
+                path: "ranch/notes/aws-cost-review.md".to_owned(),
+                file: PathBuf::from("/work/ranch/notes/aws-cost-review.md"),
+            }],
+        });
+        append(&path, &[brief]).unwrap();
+        let t = Transcript {
+            actions: vec![action(
+                "2026-11-20T10:05:00Z",
+                ActionKind::Shell,
+                "kvault get cccc3333 | head -80",
+            )],
+            ..Transcript::default()
+        };
+        mark_used(&path, "s1", Some(Path::new("/work/mas")), &t).unwrap();
+        mark_used(&path, "s1", Some(Path::new("/work/mas")), &t).unwrap();
+        let uses: Vec<UseEvent> = read(&path)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Use(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1);
+        assert_eq!((uses[0].from, uses[0].how), (Source::Brief, How::Get));
+        assert_eq!(uses[0].query_at, "2026-11-20T10:00:00Z");
+    }
+
+    #[test]
+    fn lines_written_before_a_field_existed_still_parse() {
+        let old = r#"{"event":"query","at":"2026-11-20T10:00:00Z","command":"recall","query":"q","total":0,"hits":[]}
+{"event":"use","at":"2026-11-20T10:01:00Z","session":"s","query_at":"2026-11-20T10:00:00Z","id":"aaaa1111","how":"get"}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queries.jsonl");
+        std::fs::write(&path, old).unwrap();
+        let events = read(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[1], Event::Use(u) if u.from == Source::Query));
     }
 
     #[test]
@@ -412,9 +614,16 @@ mod tests {
             ],
             ..Transcript::default()
         };
-        assert_eq!(mark_used(&path, "s2", &t).unwrap(), 0);
-        assert_eq!(mark_used(&path, "", &t).unwrap(), 0);
-        assert_eq!(mark_used(&path, "s1", &t).unwrap(), 1);
+        assert_eq!(mark_used(&path, "", None, &t).unwrap(), 0);
+        mark_used(&path, "s2", None, &t).unwrap();
+        assert!(uses_in(&path).is_empty(), "another session's query");
+        mark_used(&path, "s1", None, &t).unwrap();
         assert_eq!(uses_in(&path), vec![("aaaa1111".to_owned(), How::Get)]);
+        let sessions = read(&path)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::Session(_)))
+            .count();
+        assert_eq!(sessions, 2, "one line per session however often Stop runs");
     }
 }

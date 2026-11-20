@@ -129,6 +129,7 @@ fn run(command: Command) -> kvault::Result<()> {
             outln!("{}", hooks::run(event));
             Ok(())
         }
+        Command::Report { since, json, full } => report(since.as_deref(), json, full),
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
         Command::Bench {
             file,
@@ -216,7 +217,9 @@ fn search(args: &SearchArgs) -> kvault::Result<()> {
         since: args.since.clone(),
         per_chunk: args.per_chunk,
     };
+    let started = std::time::Instant::now();
     let result = kvault::search::run(&store, &query, &opts)?;
+    let elapsed = started.elapsed();
     if let Ok(config) = Config::load() {
         querylog::record(
             &config,
@@ -226,6 +229,10 @@ fn search(args: &SearchArgs) -> kvault::Result<()> {
                 project: args.project.as_deref(),
                 budget: None,
                 total: result.candidates,
+                weak: false,
+                coverage: None,
+                tokens: None,
+                elapsed,
                 hits: result
                     .hits
                     .iter()
@@ -251,6 +258,7 @@ fn recall(
     let store = open_store()?;
     let raw = query;
     let query = Query::parse(raw);
+    let started = std::time::Instant::now();
     let result = kvault::recall::run(
         &store,
         &query,
@@ -260,6 +268,7 @@ fn recall(
             format,
         },
     )?;
+    let elapsed = started.elapsed();
     if let Ok(config) = Config::load() {
         querylog::record(
             &config,
@@ -269,6 +278,10 @@ fn recall(
                 project,
                 budget: Some(budget),
                 total: result.total,
+                weak: result.weak,
+                coverage: result.coverage,
+                tokens: Some(result.tokens),
+                elapsed,
                 hits: result
                     .entries
                     .iter()
@@ -349,6 +362,36 @@ fn bench(
             "hit@5 {:.2} is below the required {min:.2}",
             report.kvault.metrics.hit5
         )));
+    }
+    Ok(())
+}
+
+fn report(since: Option<&str>, json: bool, full: bool) -> kvault::Result<()> {
+    let since = match since {
+        Some(s) => Some(
+            kvault::search::parse_since(s)
+                .ok_or_else(|| Error::Other(anyhow::anyhow!("cannot parse --since {s:?}")))?,
+        ),
+        None => None,
+    };
+    let Some(log) = Config::query_log_path() else {
+        return Err(Error::Other(anyhow::anyhow!(
+            "no state directory available"
+        )));
+    };
+    let events = kvault::report::load(&log, since.as_deref())?;
+    if full {
+        out!("{}", kvault::report::full(&events)?);
+        return Ok(());
+    }
+    let errors =
+        Config::hook_log_path().map_or(0, |p| kvault::report::hook_errors(&p, since.as_deref()));
+    let summary = kvault::report::summarize(&events, errors);
+    if json {
+        let text = serde_json::to_string_pretty(&summary).map_err(|e| Error::Other(e.into()))?;
+        outln!("{text}");
+    } else {
+        out!("{}", summary.render());
     }
     Ok(())
 }

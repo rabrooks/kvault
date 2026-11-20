@@ -333,6 +333,83 @@ fn queries_are_logged_and_stop_marks_the_results_that_were_used() {
 }
 
 #[test]
+fn briefs_and_sessions_are_logged_and_report_summarises_them() {
+    let e = env(None);
+    let cwd = e.fx.base.join("proj-a");
+    let start =
+        serde_json::json!({"session_id":"sess-0002","cwd":cwd,"source":"startup"}).to_string();
+    e.hook("session-start", &start);
+    let log = query_log(&e);
+    assert_eq!(log.len(), 1, "{log:?}");
+    let brief = &log[0];
+    assert_eq!(brief["event"], "brief");
+    assert_eq!(brief["session"], "sess-0002");
+    assert_eq!(brief["project"], "proj-a");
+    assert_eq!(brief["source"], "startup");
+    assert!(brief["tokens"].as_u64().unwrap() > 0);
+    assert!(brief["docs"].as_i64().unwrap() >= 8);
+    assert!(brief["version"].is_string());
+    let listed = brief["hits"].as_array().unwrap();
+    assert!(!listed.is_empty());
+
+    // The session reads a note the brief listed, and never searches.
+    let t = e.fx.base.join("transcript.jsonl");
+    let lines = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"carry on"},
+            "timestamp":"2026-10-28T16:45:30.000Z"}).to_string(),
+        serde_json::json!({"type":"assistant","timestamp":"2999-01-01T00:00:00.000Z","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":listed[0]["file"]}}
+        ]}}).to_string(),
+    ];
+    write(&t, &(lines.join("\n") + "\n"));
+    let stop = serde_json::json!({"session_id":"sess-0002","cwd":cwd,"transcript_path":t,
+        "last_assistant_message":"done"})
+    .to_string();
+    e.hook("stop", &stop);
+    e.hook("stop", &stop);
+    assert_eq!(e.log(), "");
+    let log = query_log(&e);
+    let of = |kind: &str| log.iter().filter(|l| l["event"] == kind).count();
+    assert_eq!(
+        (of("brief"), of("session"), of("use"), of("query")),
+        (1, 1, 1, 0)
+    );
+    let used = log.iter().find(|l| l["event"] == "use").unwrap();
+    assert_eq!(used["from"], "brief");
+    assert_eq!(used["how"], "file");
+    assert_eq!(used["query_at"], brief["at"]);
+
+    let out = e.kvault().args(["report"]).assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        text.contains("sessions  1 given a brief, 1 completed a turn"),
+        "{text}"
+    );
+    assert!(
+        text.contains("0 searched (0%), 0 used a result (0%), 1 used a note from the brief (100%)"),
+        "{text}"
+    );
+    assert!(text.contains("uses      brief:file 1"), "{text}");
+    assert!(
+        !text.contains("proj-a"),
+        "no project names in the summary:\n{text}"
+    );
+    let json = e.kvault().args(["report", "--json"]).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&json.get_output().stdout).unwrap();
+    assert_eq!(v["sessions"]["followed_the_brief"], 1);
+    assert_eq!(v["briefs"]["injected"], 1);
+    e.kvault()
+        .args(["report", "--full", "--since", "1d"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"event\":\"brief\""));
+    e.kvault()
+        .args(["report", "--since", "soon"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn query_log_can_be_disabled() {
     let mut e = env(None);
     e.fx.config.query_log.enabled = false;

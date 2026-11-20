@@ -195,14 +195,25 @@ durable note is the agent's job, through the skill and `kvault add`.
 
 ### Query log
 
-Every `search` and `recall` appends one JSON line to `~/.local/state/kvault/queries.jsonl`
-(`KVAULT_QUERY_LOG` overrides; beside the index when `KVAULT_DB` is set): the query, the
-working directory, the Claude Code session, and the ids and files of the results shown.
-The Stop and `PreCompact` hooks then add a `use` line for each result the session went on
-to use: fetched with `kvault get`, read or edited by a file tool, named in a shell
-command, or named in the assistant's text. It is the record of whether retrieval is
-helping, and nothing reads it yet but you (`jq` works). Queries stay on this machine;
+`~/.local/state/kvault/queries.jsonl` (`KVAULT_QUERY_LOG` overrides; beside the index when
+`KVAULT_DB` is set) gets one JSON line per event, each stamped with the kvault version:
+
+| Line | Written by | Holds |
+|---|---|---|
+| `query` | `search`, `recall` | the query, working directory, session, results shown, time taken; for `recall` also tokens printed, the share of the query found and whether the reply was a weak match |
+| `brief` | `SessionStart` hook | session, project, tokens, the notes listed, index size |
+| `session` | first Stop or `PreCompact` of a session | that the session completed a turn |
+| `use` | Stop, `PreCompact` | a note a query or the brief listed that the session then used: fetched with `kvault get`, touched by a file tool, named in a shell command, or named in the assistant's text |
+
+It is the record of whether retrieval is helping. Nothing leaves the machine;
 `[query_log] enabled = false` turns it off.
+
+`kvault report [--since 7d] [--json]` summarises it: sessions given a brief, sessions that
+searched, queries with a result used, notes from the brief that were followed up, weak
+matches, tokens and latency, hook errors. The summary holds counts and rates only (no
+query text, paths or project names), so it can be sent to someone else as it is, and
+`--json` makes several people's reports easy to pool. `kvault report --full` prints the
+log lines themselves, which do contain query text and file paths: read it before sharing.
 
 ```
 kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P | --root DIR] [--file F]
@@ -226,7 +237,7 @@ kvault recall <q> --budget N [--project P]   search packed to a token budget (ag
 kvault get <id|path>[:from[:count]]          print a chunk or line window
 kvault brief [--cwd P] [--budget N]          what the SessionStart hook injects
 kvault add --title T [--kind K] [--tags a,b] write a note and index it
-kvault list / links / status / bench
+kvault list / links / status / bench / report
 kvault hook session-start|stop|pre-compact   Claude Code hook entry points
 kvault serve                                 MCP stdio (feature `mcp`)
 ```

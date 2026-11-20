@@ -19,6 +19,7 @@ use crate::cli::HookEvent;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::{self, IndexOptions};
+use crate::pack::{ByteHeuristic, TokenCounter};
 use crate::querylog;
 use crate::store::Store;
 
@@ -122,7 +123,7 @@ fn session_start(
         // A stale brief beats none.
         log(HookEvent::SessionStart, &format!("index: {e:#}"));
     }
-    let text = brief::run(
+    let brief = brief::build(
         store,
         &BriefOptions {
             cwd: cwd.to_path_buf(),
@@ -130,10 +131,35 @@ fn session_start(
             recent_days: config.brief.recent_days,
         },
     )?;
-    if text.trim().is_empty() {
+    if brief.text.trim().is_empty() {
         return Ok(json!({}));
     }
-    Ok(session_start_output(&text))
+    let counts = store.counts()?;
+    querylog::record_brief(
+        config,
+        querylog::BriefEvent {
+            at: jiff::Timestamp::now().to_string(),
+            version: querylog::version(),
+            session: input.session_id.clone(),
+            source: input.source.clone(),
+            project: brief.project,
+            cwd: Some(cwd.to_path_buf()),
+            tokens: ByteHeuristic.count(&brief.text),
+            docs: counts.docs,
+            chunks: counts.chunks,
+            roots: counts.roots,
+            hits: brief
+                .items
+                .into_iter()
+                .map(|i| querylog::LoggedHit {
+                    id: i.id,
+                    path: i.path,
+                    file: i.file,
+                })
+                .collect(),
+        },
+    );
+    Ok(session_start_output(&brief.text))
 }
 
 /// The `SessionStart` response that injects `text` as context.
@@ -170,11 +196,10 @@ fn capture_session(
     }
     if config.query_log.enabled
         && let Some(log_path) = Config::query_log_path()
-        && log_path.is_file()
         && let Some(transcript) = input.transcript_path.as_deref().filter(|p| p.is_file())
     {
         let scan = capture::scan_transcript(transcript)?;
-        querylog::mark_used(&log_path, &input.session_id, &scan)?;
+        querylog::mark_used(&log_path, &input.session_id, Some(cwd), &scan)?;
     }
     Ok(json!({}))
 }

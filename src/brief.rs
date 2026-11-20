@@ -62,11 +62,40 @@ struct Doc {
     updated: Option<String>,
 }
 
-/// Build the brief.
+/// A note the brief lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    /// Short chunk id, as printed.
+    pub id: String,
+    /// Display path, as printed.
+    pub path: String,
+    /// Absolute path of the file.
+    pub file: std::path::PathBuf,
+}
+
+/// The brief and what it lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Brief {
+    /// Empty when even the header does not fit the budget.
+    pub text: String,
+    pub project: Option<String>,
+    /// The notes listed, in the order printed.
+    pub items: Vec<Item>,
+}
+
+/// Build the brief's text.
 ///
 /// # Errors
 /// Returns an error if the index cannot be read.
 pub fn run(store: &Store, opts: &BriefOptions) -> Result<String> {
+    Ok(build(store, opts)?.text)
+}
+
+/// Build the brief.
+///
+/// # Errors
+/// Returns an error if the index cannot be read.
+pub fn build(store: &Store, opts: &BriefOptions) -> Result<Brief> {
     let project = project_for(store, &opts.cwd)?;
     let header = header(store, project.as_deref())?;
     let footer = "Search: `kvault recall \"<q>\" --budget 1500` · Read: `kvault get <id>` · Save: `kvault add`\n";
@@ -84,6 +113,7 @@ pub fn run(store: &Store, opts: &BriefOptions) -> Result<String> {
         sections.push((Section::Related, related(store, p)?));
     }
     let mut seen: Vec<i64> = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     let mut lines: Vec<(Section, String)> = Vec::new();
     for (section, docs) in &sections {
         let docs: Vec<&Doc> = docs
@@ -94,6 +124,11 @@ pub fn run(store: &Store, opts: &BriefOptions) -> Result<String> {
         for d in docs {
             if let Some(chunk) = firsts.get(&d.r.doc_id) {
                 seen.push(d.r.doc_id);
+                items.push(Item {
+                    id: chunk.id.clone(),
+                    path: d.r.display_path(),
+                    file: d.r.abs_path(),
+                });
                 lines.push((*section, line(*section, d, chunk)));
             }
         }
@@ -118,11 +153,20 @@ pub fn run(store: &Store, opts: &BriefOptions) -> Result<String> {
     let mut text = render(&lines);
     while ByteHeuristic.count(&text) > opts.budget || text.len() > MAX_BYTES {
         if lines.pop().is_none() {
-            return Ok(String::new());
+            return Ok(Brief {
+                project,
+                ..Brief::default()
+            });
         }
         text = render(&lines);
     }
-    Ok(text)
+    // One item per line, shed from the tail together.
+    items.truncate(lines.len());
+    Ok(Brief {
+        text,
+        project,
+        items,
+    })
 }
 
 /// `# kvault: <project> (N notes, M memory facts, indexed 3m ago)`. Counts

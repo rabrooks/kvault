@@ -108,6 +108,20 @@ pub enum Command {
     },
     /// Roots, counts, index age, database size
     Status,
+    /// What the query log says about a period of use: counts and rates
+    /// only, safe to hand to someone else
+    Report {
+        /// Only events since then, e.g. `7d`, `2026-11-20`
+        #[arg(long)]
+        since: Option<String>,
+        /// The summary as `JSON`, for pooling several people's reports
+        #[arg(long, conflicts_with = "full")]
+        json: bool,
+        /// The log lines themselves, which include query text and file
+        /// paths: read before sharing
+        #[arg(long)]
+        full: bool,
+    },
     /// Run a retrieval benchmark file (JSON lines: query, expected, note)
     Bench {
         file: String,
