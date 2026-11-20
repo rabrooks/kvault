@@ -433,7 +433,7 @@ mod tests {
             query: "replica sku".to_owned(),
             project: None,
             budget: Some(1500),
-            cwd: Some(PathBuf::from("/work/mas")),
+            cwd: Some(PathBuf::from("/work/app")),
             session: Some(session.to_owned()),
             total: 2,
             weak: false,
@@ -443,13 +443,13 @@ mod tests {
             hits: vec![
                 LoggedHit {
                     id: "aaaa1111".to_owned(),
-                    path: "mas/notes/plans/replica-sizing.md".to_owned(),
-                    file: PathBuf::from("/work/mas/notes/plans/replica-sizing.md"),
+                    path: "app/notes/plans/replica-sizing.md".to_owned(),
+                    file: PathBuf::from("/work/app/notes/plans/replica-sizing.md"),
                 },
                 LoggedHit {
                     id: "bbbb2222".to_owned(),
-                    path: "mas/todo.md".to_owned(),
-                    file: PathBuf::from("/work/mas/todo.md"),
+                    path: "app/todo.md".to_owned(),
+                    file: PathBuf::from("/work/app/todo.md"),
                 },
             ],
         })
@@ -499,7 +499,7 @@ mod tests {
                 action(
                     "2026-11-20T09:59:00.000Z",
                     ActionKind::File,
-                    "/work/mas/todo.md",
+                    "/work/app/todo.md",
                 ),
                 action(
                     "2026-11-20T10:00:05.250Z",
@@ -534,7 +534,7 @@ mod tests {
         t.actions.push(action(
             "2026-11-20T10:01:00Z",
             ActionKind::File,
-            "/work/mas/todo.md",
+            "/work/app/todo.md",
         ));
         assert_eq!(mark_used(&path, "s1", None, &t).unwrap(), 1);
         assert_eq!(uses_in(&path).last().unwrap().1, How::File);
@@ -549,16 +549,16 @@ mod tests {
             version: version(),
             session: "s1".to_owned(),
             source: Some("startup".to_owned()),
-            project: Some("mas".to_owned()),
-            cwd: Some(PathBuf::from("/work/mas")),
+            project: Some("app".to_owned()),
+            cwd: Some(PathBuf::from("/work/app")),
             tokens: 300,
             docs: 10,
             chunks: 40,
             roots: 2,
             hits: vec![LoggedHit {
                 id: "cccc3333".to_owned(),
-                path: "ranch/notes/aws-cost-review.md".to_owned(),
-                file: PathBuf::from("/work/ranch/notes/aws-cost-review.md"),
+                path: "other/notes/cost-review.md".to_owned(),
+                file: PathBuf::from("/work/other/notes/cost-review.md"),
             }],
         });
         append(&path, &[brief]).unwrap();
@@ -570,8 +570,8 @@ mod tests {
             )],
             ..Transcript::default()
         };
-        mark_used(&path, "s1", Some(Path::new("/work/mas")), &t).unwrap();
-        mark_used(&path, "s1", Some(Path::new("/work/mas")), &t).unwrap();
+        mark_used(&path, "s1", Some(Path::new("/work/app")), &t).unwrap();
+        mark_used(&path, "s1", Some(Path::new("/work/app")), &t).unwrap();
         let uses: Vec<UseEvent> = read(&path)
             .unwrap()
             .into_iter()

@@ -7,20 +7,15 @@ MCP adapter.
 
 ## Status
 
-**v0 rebuild in progress.** The 0.1 manifest/ripgrep/Tantivy code was removed; it never saw
-real use. Commands land milestone by milestone:
+**0.2.0-beta.1, in trial use.** Indexing, search, budgeted recall, the session brief, the
+Claude Code hooks and skill, session capture, `add`, the query log and `report` all work.
+Two commands are declared but not built, and exit with code 3 saying so: `links` (link
+neighbours of a note) and `serve` (an MCP stdio adapter, behind `--features mcp`). Links
+are already extracted and used by the brief; there is no link-based ranking yet.
 
-| Milestone | Delivers | State |
-|---|---|---|
-| M0 | toolchain pin, module tree, schema v1, `status`, CI | done |
-| M1 | `init`, `index`, `list` over real roots (incremental, rename-safe) | done |
-| M2 | `search`, `get`, `--explain`, `bench` | done |
-| M3 | `recall` budget packer, `brief` | done |
-| M4 | Claude Code hooks, `SKILL.md`, `add`, session capture | done |
-| M5 | links stream, `links` | next |
-| M6 | MCP stdio adapter (`--features mcp`) | |
-
-Commands that are not implemented yet exit with code 3 and name their milestone.
+The on-disk index is derived and its schema may change between versions; it migrates on
+open, and `rm ~/.local/share/kvault/index.db && kvault index` rebuilds it from the notes at
+any time.
 
 ## Why
 
@@ -34,14 +29,26 @@ Design principles: markdown is the only truth; index what exists (frontmatter op
 budgets are tokens, not counts; hooks are fast and silent; no LLM and no daemon in the loop;
 ranking is explainable; the core stays small.
 
-## Build
+## Quick start
 
 Requires Rust 1.95 (pinned in `rust-toolchain.toml`; `rustup` picks it up).
 
 ```bash
-cargo build --release
-cargo test
+git clone https://github.com/rabrooks/kvault && cd kvault
+cargo install --path .        # puts `kvault` on PATH (~/.cargo/bin)
+kvault init                   # writes the config with the roots that exist, then indexes
+kvault status                 # roots found, document counts
+kvault recall "something you know is in your notes"
+claude --plugin-dir "$PWD"    # a Claude Code session with the hooks and the skill
 ```
+
+`kvault init` looks for Claude Code memory dirs (`~/.claude/projects/*/memory`), project
+notes (`~/Projects/*/notes`) and `~/Projects/notes`. If your notes live elsewhere, edit the
+config (next section) and run `kvault index`. Nothing is uploaded anywhere. kvault never
+moves or rewrites your notes: the only files it writes are session notes, notes you `add`,
+and the pointer line `add` appends to `MEMORY.md` in a Claude Code memory dir.
+
+To work on kvault itself: `cargo build --release` and `cargo test`.
 
 ## Configuration
 
@@ -64,12 +71,35 @@ path = "~/Projects/notes"
 kind = "reference"
 weight = 0.8
 
+[[roots]]
+path = "~/work/handbook"               # a directory that is itself the notes
+kind = "notes"
+project_from = "dir"                   # project = the directory's own name
+demote = ["**/archive/**"]             # the default: these rank a little below their peers
+demote_factor = 0.9
+
+[projects.handbook]                    # one project known by several names
+aliases = ["work-handbook"]            # e.g. the name its Claude memory slug derives
+
+[capture]
+enabled = true                         # session notes on Stop / PreCompact
+session_dir = "notes/sessions"         # under the project, when it has a notes dir
+fallback_dir = "~/.local/share/kvault/sessions"   # otherwise; indexed automatically
+
 [brief]
 budget = 2000
 recent_days = 14
+
+[query_log]
+enabled = true
 ```
 
-`kvault init` writes this for you (only roots that exist on disk) and runs the first index.
+`kvault init` writes the first three roots for you (only those that exist on disk) and runs
+the first index. `kind` is `memory`, `notes`, `reference` or `other`. `project_from` names
+the project a root's files belong to: `parent` (the directory above, for `<project>/notes`),
+`dir` (the root's own name), `claude_slug` (a Claude Code memory dir), or `none`. The
+project is what `--project` filters on and how the brief knows which notes are "here";
+when two roots name the same project differently, an alias joins them.
 
 ## Indexing
 
@@ -88,7 +118,8 @@ optional: `title`, `description`, `kind`/`type`, `tags`, `created`, `updated`, `
 lifted, everything else is kept as filterable metadata. `[[wikilinks]]`, relative `.md` links,
 `- verb [[Target]]` relations, and `- [category] text #tag` observation lines are extracted.
 
-On a corpus of 226 files / 1.3 MB: cold index ~200 ms, warm ~4 ms.
+On a corpus of about 630 files: re-hashing everything (`--full`) takes roughly 200 ms, an
+unchanged run about 10 ms.
 
 ## Searching
 
@@ -107,7 +138,9 @@ kvault search ... --format cli|json|md|paths|ids --explain --per-chunk -n 20
 Four streams run independently and are fused by reciprocal rank fusion (k=60): all-terms
 FTS (weight 2), any-term FTS, exact title match, and tag match. Exclusions (`-word`, `-tag:x`,
 `NOT` inside `lex:`) apply to every stream. A small authority multiplier (0.85–1.15) from the
-root weight and `pinned: true` breaks ties. Results are one chunk per document with the other
+root weight and `pinned: true` breaks ties, and files matching a root's `demote` globs take a
+further ×0.9 inside that band. A `MEMORY.md` index in a memory root never outranks a fact it
+points to on a line matching the query. Results are one chunk per document with the other
 matching chunks listed as siblings. `--explain` prints each hit's per-stream rank and raw
 score, its fused score, and per-stream timings.
 
@@ -153,7 +186,8 @@ marked `[stale]` and shown as a preview at most, never quoted in full.
 
 `kvault brief [--cwd P] [--budget N]` prints the context block the SessionStart hook injects
 for a working directory: pinned notes and rules, notes updated in the last 14 days, and
-notes elsewhere that link to or share tags with the project, one line each with a chunk id.
+notes elsewhere that link to or share tags with the project (the `session` tag aside), one
+line each with a chunk id.
 The project is the nearest ancestor directory whose name matches a configured root's
 project. The block fits the budget (2000 tokens by default) and stays under 8,000 characters
 so Claude Code does not swap it for a file preview; the header line is byte-stable across
@@ -173,9 +207,9 @@ or copy the three hook entries into `~/.claude/settings.json` and the skill dire
 
 | Event | Command | What it does |
 |---|---|---|
-| `SessionStart` (`startup`, `clear`, `compact`; not `resume` or `fork`) | `kvault hook session-start` | incremental index, then injects `kvault brief` for the session's `cwd` as `additionalContext` |
-| `Stop` | `kvault hook stop` | writes or rewrites the session note, indexes it |
-| `PreCompact` | `kvault hook pre-compact` | same writer, so a compaction never loses the note |
+| `SessionStart` (`startup`, `clear`, `compact`; not `resume` or `fork`) | `kvault hook session-start` | incremental index, then injects `kvault brief` for the session's `cwd` as `additionalContext`; logs the brief |
+| `Stop` | `kvault hook stop` | writes or rewrites the session note, indexes it; logs which listed notes the session used |
+| `PreCompact` | `kvault hook pre-compact` | same as Stop, so a compaction never loses the note |
 
 Hooks read Claude Code's JSON on stdin, print JSON on stdout and always exit 0. A failure
 prints `{}` and appends one line to `~/.local/state/kvault/hooks.log` (`KVAULT_LOG`
@@ -186,12 +220,25 @@ The session note is `<project>/notes/sessions/<date>-<session8>.md`, one file pe
 rewritten on every stop, where `<project>` is the nearest ancestor of `cwd` with a `.git`.
 When the project has no `notes/` dir it goes to `[capture] fallback_dir` (default
 `~/.local/share/kvault/sessions/<project>/`). Each project directory there is indexed
-without being configured, as an `other` root named for the project. The note carries `kind: session`, the first prompt (its first line is the title, so
-the brief's recent list reads as a log), the last assistant message, and the files the
+without being configured, as an `other` root named for the project. The note carries
+`kind: session`, the first prompt (its first line is the title, so the brief's recent
+list reads as a log), the last assistant message, and the files the
 transcript shows were read or edited. `<private>…</private>` spans are dropped and
 credential-shaped tokens (PEM blocks, `Bearer x`, AWS, GitHub, Slack, OpenAI, Anthropic
 and Google key prefixes) are replaced with `[redacted]`. Promoting a session note into a
 durable note is the agent's job, through the skill and `kvault add`.
+
+```
+kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P | --root DIR] [--file F]
+```
+
+writes `<slug>.md` with frontmatter into the project's notes root (the memory root when
+that is the only one; `--root` to choose) and indexes it. The body comes from `--file` or
+stdin. An existing file is replaced only when `--expected-hash` matches the BLAKE3 the
+previous `add` printed (a prefix of eight or more hex digits is enough), so two agents
+cannot overwrite each other unknowingly. In a Claude Code memory root the file uses that
+loader's `name`/`description`/`metadata.type` frontmatter and a pointer line is appended to
+`MEMORY.md`.
 
 ### Query log
 
@@ -215,19 +262,7 @@ query text, paths or project names), so it can be sent to someone else as it is,
 `--json` makes several people's reports easy to pool. `kvault report --full` prints the
 log lines themselves, which do contain query text and file paths: read it before sharing.
 
-```
-kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P | --root DIR] [--file F]
-```
-
-writes `<slug>.md` with frontmatter into the project's notes root (the memory root when
-that is the only one; `--root` to choose) and indexes it. The body comes from `--file` or
-stdin. An existing file is replaced only when `--expected-hash` matches the BLAKE3 the
-previous `add` printed (a prefix of eight or more hex digits is enough), so two agents
-cannot overwrite each other unknowingly. In a Claude Code memory root the file uses that
-loader's `name`/`description`/`metadata.type` frontmatter and a pointer line is appended to
-`MEMORY.md`.
-
-## CLI (v0 surface)
+## CLI
 
 ```
 kvault init                                  write config, index
@@ -237,9 +272,12 @@ kvault recall <q> --budget N [--project P]   search packed to a token budget (ag
 kvault get <id|path>[:from[:count]]          print a chunk or line window
 kvault brief [--cwd P] [--budget N]          what the SessionStart hook injects
 kvault add --title T [--kind K] [--tags a,b] write a note and index it
-kvault list / links / status / bench / report
+kvault list [--project P] [--recent N]       indexed documents, newest first
+kvault status                                roots, counts, absent roots, index age
+kvault report [--since 7d] [--json|--full]   what the query log says about a period
+kvault bench <queries.jsonl> [--baseline]    retrieval quality over a query file
 kvault hook session-start|stop|pre-compact   Claude Code hook entry points
-kvault serve                                 MCP stdio (feature `mcp`)
+kvault links / serve                         not built yet (exit 3)
 ```
 
 ## License
