@@ -31,6 +31,8 @@ pub const TRANSCRIPT_TAIL: u64 = 896 * 1024;
 pub const LAST_MESSAGE_CHARS: usize = 4_000;
 /// Characters kept of the first prompt.
 pub const PROMPT_CHARS: usize = 600;
+/// The tag every session note carries.
+pub const SESSION_TAG: &str = "session";
 /// Characters of the first prompt line used as the note title.
 const TITLE_CHARS: usize = 80;
 
@@ -226,7 +228,7 @@ fn render(n: &Note<'_>) -> String {
         updated: local_time(n.updated),
         prompts: n.transcript.prompts,
         files_touched: files.iter().map(|(p, _)| p.clone()).collect(),
-        tags: ["session"],
+        tags: [SESSION_TAG],
     };
     let mut out = String::new();
     out.push_str("---\n");

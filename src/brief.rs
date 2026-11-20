@@ -13,6 +13,7 @@ use std::path::Path;
 
 use rusqlite::params_from_iter;
 
+use crate::capture::SESSION_TAG;
 use crate::error::Result;
 use crate::get::{self, CHUNK_REF_COLUMNS, ChunkRef, DocRef, chunk_ref_from_row};
 use crate::list::{self, ListFilter};
@@ -256,7 +257,9 @@ fn recent(store: &Store, project: Option<&str>, days: u32) -> Result<Vec<Doc>> {
 }
 
 /// Documents outside the project that link to or from it, or share a tag
-/// with it, by number of such connections.
+/// with it, by number of such connections. The tag every session note
+/// carries is not a connection: it would relate each project to every
+/// session anywhere.
 fn related(store: &Store, project: &str) -> Result<Vec<Doc>> {
     let sql = format!(
         "WITH here AS (SELECT d.id FROM docs d JOIN roots r ON r.id = d.root_id
@@ -267,7 +270,8 @@ fn related(store: &Store, project: &str) -> Result<Vec<Doc>> {
                        WHERE l.from_doc_id IN here AND l.to_doc_id IS NOT NULL
                        UNION ALL
                        SELECT t.doc_id FROM tags t
-                       WHERE t.tag IN (SELECT tag FROM tags WHERE doc_id IN here))
+                       WHERE t.tag <> '{SESSION_TAG}'
+                         AND t.tag IN (SELECT tag FROM tags WHERE doc_id IN here))
          SELECT {DOC_COLUMNS} FROM hits h
          JOIN docs d ON d.id = h.id JOIN roots r ON r.id = d.root_id
          WHERE d.active = 1 AND r.present = 1 AND d.id NOT IN here

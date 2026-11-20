@@ -294,6 +294,40 @@ fn brief_detects_the_project_and_fits_its_limits() {
     );
 }
 
+#[test]
+fn session_notes_elsewhere_are_not_related_by_their_shared_tag() {
+    let mut fx = fixture();
+    for project in ["proj-a", "proj-b"] {
+        common::write(
+            &fx.base
+                .join(project)
+                .join("notes/sessions/2026-11-20-abcd0000.md"),
+            "---\ntitle: A session\nkind: session\ntags: [session]\n---\n# A session\n\nWhat happened.\n",
+        );
+    }
+    kvault::index::run(
+        &fx.config,
+        &mut fx.store,
+        &kvault::index::IndexOptions::default(),
+    )
+    .unwrap();
+    let opts = BriefOptions {
+        cwd: fx.base.join("proj-a"),
+        budget: 2000,
+        recent_days: 14,
+    };
+    let text = brief::run(&fx.store, &opts).unwrap();
+    assert!(
+        text.contains("proj-a/notes/sessions/2026-11-20-abcd0000.md"),
+        "its own session is recent:\n{text}"
+    );
+    assert!(
+        !text.contains("proj-b/notes/sessions/"),
+        "another project's session is not related:\n{text}"
+    );
+    assert!(text.contains("proj-b/notes/cross.md"), "{text}");
+}
+
 fn cli(fx: &Fixture) -> Command {
     let cfg = fx.base.join("config.toml");
     std::fs::write(&cfg, fx.config.to_toml().unwrap()).unwrap();
