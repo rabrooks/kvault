@@ -89,6 +89,7 @@ fn workspace(tweak: impl FnOnce(&mut Config)) -> Workspace {
                 aliases: vec!["work-mas".to_owned()],
             },
         )]),
+        capture: common::isolated_capture(&base),
         ..Config::default()
     };
     tweak(&mut config);

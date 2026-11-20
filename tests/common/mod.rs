@@ -17,6 +17,16 @@ pub struct Fixture {
     pub store: Store,
 }
 
+/// Capture settings whose fallback dir is inside the fixture, so the
+/// session roots kvault indexes on its own are the fixture's, not the
+/// developer's.
+pub fn isolated_capture(base: &Path) -> kvault::config::CaptureConfig {
+    kvault::config::CaptureConfig {
+        fallback_dir: base.join("sessions").to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
 pub fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
@@ -93,6 +103,7 @@ pub fn fixture() -> Fixture {
                 )
             },
         ],
+        capture: isolated_capture(&base),
         ..Config::default()
     };
     let mut store = Store::open(&base.join("index.db")).unwrap();

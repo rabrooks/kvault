@@ -136,7 +136,7 @@ fn other(msg: impl Into<String>) -> Error {
 
 /// Pick the directory to write into and the configured root it is under.
 fn target(config: &Config, store: &Store, opts: &AddOptions) -> Result<(PathBuf, Option<Root>)> {
-    let expanded = roots::expand(&config.roots, &config.project_aliases());
+    let expanded = roots::expand_config(config);
     if let Some(dir) = &opts.root {
         if !dir.is_dir() {
             return Err(other(format!(

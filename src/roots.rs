@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use directories::BaseDirs;
 
-use crate::config::{ProjectFrom, RootConfig, expand_tilde};
+use crate::config::{Config, GLOBAL_SESSIONS_DIR, ProjectFrom, RootConfig, expand_tilde};
 
 /// What kind of knowledge a root holds. Drives ranking authority and defaults.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -47,6 +47,12 @@ pub struct Root {
     /// Globs relative to the root whose files are demoted; see [`demote_set`].
     pub demote: Vec<String>,
     pub demote_factor: f64,
+}
+
+/// The directories a config indexes, see [`Config::effective_roots`].
+#[must_use]
+pub fn expand_config(config: &Config) -> Vec<Root> {
+    expand(&config.effective_roots(), &config.project_aliases())
 }
 
 /// Expand every configured root pattern into existing directories.
@@ -133,6 +139,10 @@ pub fn derive_project(dir: &Path, from: ProjectFrom) -> Option<String> {
             .parent()
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned()),
+        ProjectFrom::Dir => dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| n != GLOBAL_SESSIONS_DIR),
         ProjectFrom::ClaudeSlug => dir
             .parent()
             .and_then(Path::file_name)

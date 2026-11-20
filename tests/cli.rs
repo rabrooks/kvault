@@ -10,6 +10,11 @@ fn kvault() -> Command {
     // Never touch the developer's real config or index.
     cmd.env("KVAULT_CONFIG", "/nonexistent/kvault-config.toml");
     cmd.env("KVAULT_DB", "/nonexistent/kvault-index.db");
+    // Nor the session notes and logs under their home directory.
+    cmd.env("HOME", "/nonexistent/home");
+    for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        cmd.env_remove(var);
+    }
     cmd
 }
 

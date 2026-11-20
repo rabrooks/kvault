@@ -11,10 +11,29 @@ use kvault::config::{Config, expand_tilde};
 use kvault::error::{Error, Milestone};
 use kvault::index::{self, IndexOptions};
 use kvault::list::{self, ListFilter};
+use kvault::querylog::{self, LoggedHit, NewQuery};
 use kvault::recall::RecallOptions;
 use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
 use kvault::{get, hooks, render, roots};
+
+/// Write to stdout, ending the process quietly when the reader has gone
+/// away (`kvault status | head`): `print!` would panic on the closed pipe.
+fn emit(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    if let Err(e) = std::io::stdout().lock().write_fmt(args) {
+        let code = i32::from(e.kind() != std::io::ErrorKind::BrokenPipe);
+        std::process::exit(code);
+    }
+}
+
+macro_rules! out {
+    ($($arg:tt)*) => { emit(format_args!($($arg)*)) };
+}
+
+macro_rules! outln {
+    ($($arg:tt)*) => { emit(format_args!("{}\n", format_args!($($arg)*))) };
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -36,11 +55,17 @@ fn run(command: Command) -> kvault::Result<()> {
     match command {
         Command::Status => status(),
         Command::Init { force } => init(force),
-        Command::Index { full, root, quiet } => {
+        Command::Index {
+            full,
+            root,
+            prune,
+            quiet,
+        } => {
             let opts = IndexOptions {
                 full,
                 quiet,
                 only_root: root.as_deref().map(expand_tilde),
+                prune,
             };
             run_index(&opts)
         }
@@ -63,7 +88,7 @@ fn run(command: Command) -> kvault::Result<()> {
         Command::Get { target, doc } => {
             let store = open_store()?;
             let out = get::run(&store, &get::Target::parse(&target), doc)?;
-            print!("{out}");
+            out!("{out}");
             Ok(())
         }
         Command::Recall {
@@ -71,7 +96,7 @@ fn run(command: Command) -> kvault::Result<()> {
             budget,
             project,
             format,
-        } => recall(&query, budget, project, format),
+        } => recall(&query, budget, project.as_deref(), format),
         Command::Brief { cwd, budget } => brief(cwd.as_deref(), budget),
         Command::Add {
             title,
@@ -101,7 +126,7 @@ fn run(command: Command) -> kvault::Result<()> {
             file.as_deref(),
         ),
         Command::Hook { event } => {
-            println!("{}", hooks::run(event));
+            outln!("{}", hooks::run(event));
             Ok(())
         }
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
@@ -140,7 +165,7 @@ fn run_index(opts: &IndexOptions) -> kvault::Result<()> {
     let mut store = open_store()?;
     let report = index::run(&config, &mut store, opts)?;
     if !opts.quiet {
-        println!("{report}");
+        outln!("{report}");
     }
     Ok(())
 }
@@ -158,9 +183,9 @@ fn init(force: bool) -> kvault::Result<()> {
     for root in Config::suggested_roots() {
         let present = roots::expand(std::slice::from_ref(&root), &config.project_aliases());
         if present.is_empty() {
-            println!("skip   {:<32} (no matching directories)", root.path);
+            outln!("skip   {:<32} (no matching directories)", root.path);
         } else {
-            println!("add    {:<32} ({} dirs)", root.path, present.len());
+            outln!("add    {:<32} ({} dirs)", root.path, present.len());
             config.roots.push(root);
         }
     }
@@ -174,7 +199,7 @@ fn init(force: bool) -> kvault::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, config.to_toml()?)?;
-    println!("wrote  {}", path.display());
+    outln!("wrote  {}", path.display());
     run_index(&IndexOptions::default())
 }
 
@@ -192,31 +217,74 @@ fn search(args: &SearchArgs) -> kvault::Result<()> {
         per_chunk: args.per_chunk,
     };
     let result = kvault::search::run(&store, &query, &opts)?;
-    print!("{}", render::render(&result, args.format, args.explain)?);
+    if let Ok(config) = Config::load() {
+        querylog::record(
+            &config,
+            NewQuery {
+                command: "search",
+                query: &args.query,
+                project: args.project.as_deref(),
+                budget: None,
+                total: result.candidates,
+                hits: result
+                    .hits
+                    .iter()
+                    .map(|h| LoggedHit {
+                        id: h.chunk.id.clone(),
+                        path: h.display_path.clone(),
+                        file: h.doc().abs_path(),
+                    })
+                    .collect(),
+            },
+        );
+    }
+    out!("{}", render::render(&result, args.format, args.explain)?);
     Ok(())
 }
 
 fn recall(
     query: &str,
     budget: usize,
-    project: Option<String>,
+    project: Option<&str>,
     format: RecallFormat,
 ) -> kvault::Result<()> {
     let store = open_store()?;
-    let query = Query::parse(query);
+    let raw = query;
+    let query = Query::parse(raw);
     let result = kvault::recall::run(
         &store,
         &query,
         &RecallOptions {
             budget,
-            project,
+            project: project.map(str::to_owned),
             format,
         },
     )?;
+    if let Ok(config) = Config::load() {
+        querylog::record(
+            &config,
+            NewQuery {
+                command: "recall",
+                query: raw,
+                project,
+                budget: Some(budget),
+                total: result.total,
+                hits: result
+                    .entries
+                    .iter()
+                    .map(|e| LoggedHit {
+                        id: e.id.clone(),
+                        path: e.path.clone(),
+                        file: e.abs_path.clone(),
+                    })
+                    .collect(),
+            },
+        );
+    }
     if result.text.is_empty() {
         eprintln!("budget {budget} is too small for any output");
     }
-    print!("{}", result.text);
+    out!("{}", result.text);
     Ok(())
 }
 
@@ -231,7 +299,7 @@ fn add(opts: &AddOptions, file: Option<&str>) -> kvault::Result<()> {
     let config = Config::load()?;
     let mut store = open_store()?;
     let added = kvault::add::run(&config, &mut store, opts, &body)?;
-    println!(
+    outln!(
         "{}  {}",
         if added.replaced {
             "replaced"
@@ -240,9 +308,9 @@ fn add(opts: &AddOptions, file: Option<&str>) -> kvault::Result<()> {
         },
         added.path.display()
     );
-    println!("blake3    {}", added.hash);
+    outln!("blake3    {}", added.hash);
     if !added.indexed {
-        println!("not indexed: the file is outside every configured root");
+        outln!("not indexed: the file is outside every configured root");
     }
     Ok(())
 }
@@ -259,7 +327,7 @@ fn brief(cwd: Option<&str>, budget: Option<usize>) -> kvault::Result<()> {
         budget: budget.unwrap_or(config.brief.budget),
         recent_days: config.brief.recent_days,
     };
-    print!("{}", kvault::brief::run(&store, &opts)?);
+    out!("{}", kvault::brief::run(&store, &opts)?);
     Ok(())
 }
 
@@ -273,7 +341,7 @@ fn bench(
     let store = open_store()?;
     let cases = kvault::bench::load(&expand_tilde(file))?;
     let report = kvault::bench::run(&store, &cases, &BenchOptions { limit, baseline })?;
-    print!("{}", report.render(verbose));
+    out!("{}", report.render(verbose));
     if let Some(min) = min_hit5
         && report.kvault.metrics.hit5 < min
     {
@@ -289,7 +357,7 @@ fn list_docs(filter: &ListFilter) -> kvault::Result<()> {
     let store = open_store()?;
     let docs = list::run(&store, filter)?;
     if docs.is_empty() {
-        println!("no documents (run `kvault index`?)");
+        outln!("no documents (run `kvault index`?)");
         return Ok(());
     }
     for d in &docs {
@@ -297,7 +365,7 @@ fn list_docs(filter: &ListFilter) -> kvault::Result<()> {
             .updated
             .as_deref()
             .map_or("-", |u| u.get(..10).unwrap_or(u));
-        println!(
+        outln!(
             "{:<9} {:<14} {date}  {:<6} {}  {}",
             d.root_kind,
             d.project.as_deref().unwrap_or("-"),
@@ -306,7 +374,7 @@ fn list_docs(filter: &ListFilter) -> kvault::Result<()> {
             d.title
         );
     }
-    println!("{} documents", docs.len());
+    outln!("{} documents", docs.len());
     Ok(())
 }
 
@@ -314,7 +382,7 @@ fn status() -> kvault::Result<()> {
     let config = Config::load()?;
     let config_path = Config::config_path();
 
-    println!(
+    outln!(
         "config:  {}{}",
         config_path
             .as_deref()
@@ -326,14 +394,14 @@ fn status() -> kvault::Result<()> {
         }
     );
 
-    let expanded = roots::expand(&config.roots, &config.project_aliases());
-    println!(
+    let expanded = roots::expand_config(&config);
+    outln!(
         "roots:   {} configured, {} present",
         config.roots.len(),
         expanded.len()
     );
     for r in &expanded {
-        println!(
+        outln!(
             "  {:<9} {:<4.1} {:<12} {}",
             r.kind.as_str(),
             r.weight,
@@ -342,7 +410,7 @@ fn status() -> kvault::Result<()> {
         );
     }
     if config.roots.is_empty() {
-        println!("  (none configured; run `kvault init`)");
+        outln!("  (none configured; run `kvault init`)");
     }
 
     let p = db_path()?;
@@ -350,16 +418,25 @@ fn status() -> kvault::Result<()> {
         let store = Store::open(&p)?;
         let c = store.counts()?;
         let size = std::fs::metadata(&p).map_or(0, |m| m.len());
-        println!("index:   {} ({} KB)", p.display(), size / 1024);
-        println!(
+        outln!("index:   {} ({} KB)", p.display(), size / 1024);
+        outln!(
             "         {} roots, {} docs, {} chunks, {} links, {} tags",
-            c.roots, c.docs, c.chunks, c.links, c.tags
+            c.roots,
+            c.docs,
+            c.chunks,
+            c.links,
+            c.tags
         );
+        for (path, docs) in store.absent_roots()? {
+            outln!(
+                "         absent: {path} ({docs} docs hidden; `kvault index --prune` drops them)"
+            );
+        }
         if let Some(t) = store.meta("last_index_at")? {
-            println!("         last indexed {t}");
+            outln!("         last indexed {t}");
         }
     } else {
-        println!("index:   {} (not built; run `kvault index`)", p.display());
+        outln!("index:   {} (not built; run `kvault index`)", p.display());
     }
     Ok(())
 }

@@ -296,7 +296,7 @@ struct GrepFile {
 fn grep_corpus(store: &Store) -> Result<Vec<GrepFile>> {
     let mut stmt = store.conn().prepare(
         "SELECT r.path, r.project, d.rel_path FROM docs d JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1",
+         WHERE d.active = 1 AND r.present = 1",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((

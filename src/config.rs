@@ -23,12 +23,20 @@ pub const KVAULT_DB_ENV: &str = "KVAULT_DB";
 /// Environment variable that overrides the hook log location.
 pub const KVAULT_LOG_ENV: &str = "KVAULT_LOG";
 
+/// Environment variable that overrides the query log location.
+pub const KVAULT_QUERY_LOG_ENV: &str = "KVAULT_QUERY_LOG";
+
+/// Directory under the capture fallback dir for sessions outside any
+/// project. As a root it carries no project.
+pub const GLOBAL_SESSIONS_DIR: &str = "_global";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub roots: Vec<RootConfig>,
     pub capture: CaptureConfig,
     pub brief: BriefConfig,
+    pub query_log: QueryLogConfig,
     /// Path-prefix descriptions injected onto hits under that prefix.
     pub context: BTreeMap<String, String>,
     /// Per-project settings, keyed by the project's canonical name.
@@ -114,6 +122,8 @@ pub enum ProjectFrom {
     Parent,
     /// Claude Code memory slug (`-Users-x-Projects-<name>` → `name`).
     ClaudeSlug,
+    /// The matched root's own name (`sessions/<name>` → `name`).
+    Dir,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -133,6 +143,19 @@ impl Default for CaptureConfig {
             session_dir: "notes/sessions".to_owned(),
             fallback_dir: "~/.local/share/kvault/sessions".to_owned(),
         }
+    }
+}
+
+/// The local record of searches and which results were then used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueryLogConfig {
+    pub enabled: bool,
+}
+
+impl Default for QueryLogConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -221,6 +244,25 @@ impl Config {
         Ok(())
     }
 
+    /// The roots to index: the configured ones, then one per project
+    /// directory under the capture fallback dir. kvault writes session notes
+    /// there for projects without a notes dir, so it indexes them without
+    /// being told to. They are `other` roots, so `add` never picks one as a
+    /// project's notes dir. A configured root at the same path wins.
+    #[must_use]
+    pub fn effective_roots(&self) -> Vec<RootConfig> {
+        let mut roots = self.roots.clone();
+        let fallback = self.capture.fallback_dir.trim_end_matches('/');
+        if !fallback.is_empty() {
+            roots.push(RootConfig::new(
+                format!("{fallback}/*"),
+                RootKind::Other,
+                ProjectFrom::Dir,
+            ));
+        }
+        roots
+    }
+
     /// Alias → canonical project name, for every configured alias.
     #[must_use]
     pub fn project_aliases(&self) -> BTreeMap<String, String> {
@@ -260,6 +302,21 @@ impl Config {
             return Some(PathBuf::from(p));
         }
         xdg_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("kvault").join("hooks.log"))
+    }
+
+    /// Where searches are recorded: `KVAULT_QUERY_LOG`; else, when
+    /// `KVAULT_DB` points at another index, `queries.jsonl` beside it,
+    /// since logged ids only mean something against the index that
+    /// produced them; else `queries.jsonl` beside the hook log.
+    #[must_use]
+    pub fn query_log_path() -> Option<PathBuf> {
+        if let Ok(p) = env::var(KVAULT_QUERY_LOG_ENV) {
+            return Some(PathBuf::from(p));
+        }
+        if let Ok(db) = env::var(KVAULT_DB_ENV) {
+            return Some(PathBuf::from(db).with_file_name("queries.jsonl"));
+        }
+        Self::hook_log_path().map(|p| p.with_file_name("queries.jsonl"))
     }
 
     /// The roots `kvault init` writes when none are configured.

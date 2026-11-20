@@ -49,6 +49,9 @@ pub struct Entry {
     pub stale: bool,
     /// Preview lines at `L1`, the trimmed chunk at `L2`, nothing at `L0`.
     pub text: Option<String>,
+    /// Where the file is, for callers; not part of the printed output.
+    #[serde(skip)]
+    pub abs_path: std::path::PathBuf,
 }
 
 /// The packed result.
@@ -170,6 +173,7 @@ impl Prepared {
                 Tier::L1 => Some(self.preview.clone()),
                 Tier::L2 => self.full.clone(),
             },
+            abs_path: c.doc.abs_path(),
         }
     }
 }

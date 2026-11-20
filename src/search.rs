@@ -741,7 +741,7 @@ fn fts_stream(store: &Store, expr: &str, filter: &Filter) -> Result<Vec<Candidat
          JOIN chunks c ON c.id = chunks_fts.rowid
          JOIN docs d ON d.id = c.doc_id
          JOIN roots r ON r.id = d.root_id
-         WHERE chunks_fts MATCH ? AND d.active = 1{}
+         WHERE chunks_fts MATCH ? AND d.active = 1 AND r.present = 1{}
          ORDER BY s, chunks_fts.rowid
          LIMIT {CANDIDATES}",
         filter.sql
@@ -792,7 +792,7 @@ fn title_stream(
     }
     let sql = format!(
         "SELECT d.id, d.title FROM docs d JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1{}",
+         WHERE d.active = 1 AND r.present = 1{}",
         filter.sql
     );
     let titles = store
@@ -835,7 +835,7 @@ fn tags_stream(
     let sql = format!(
         "SELECT d.id, COUNT(*) AS n
          FROM tags t JOIN docs d ON d.id = t.doc_id JOIN roots r ON r.id = d.root_id
-         WHERE t.tag IN ({placeholders}) AND d.active = 1{}
+         WHERE t.tag IN ({placeholders}) AND d.active = 1 AND r.present = 1{}
          GROUP BY d.id
          ORDER BY n DESC, d.id
          LIMIT {CANDIDATES}",
@@ -865,7 +865,7 @@ fn browse_stream(
 ) -> Result<Vec<Candidate>> {
     let sql = format!(
         "SELECT d.id FROM docs d JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1{}
+         WHERE d.active = 1 AND r.present = 1{}
          ORDER BY d.updated DESC, d.id
          LIMIT {CANDIDATES}",
         filter.sql

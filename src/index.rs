@@ -10,7 +10,9 @@
 //!   is restored onto its old id;
 //! - vanished files are soft-deleted (`active = 0`) and their chunks removed,
 //!   but only when the root was walked without errors;
-//! - a root that is missing on disk is skipped, never treated as mass delete;
+//! - a root that is missing on disk is skipped and marked absent, which hides
+//!   its documents from results; it is never treated as mass delete, so its
+//!   return costs nothing. `prune` is the explicit way to drop its rows;
 //! - an unreadable file is reported and skipped, never deleted;
 //! - the whole run is one `IMMEDIATE` transaction, so concurrent runs queue
 //!   on `busy_timeout` instead of failing.
@@ -47,6 +49,8 @@ pub struct IndexOptions {
     pub quiet: bool,
     /// Only index the root at this exact (tilde-expanded) path.
     pub only_root: Option<PathBuf>,
+    /// Delete the rows of roots that are no longer there.
+    pub prune: bool,
 }
 
 /// What an index run did.
@@ -54,6 +58,8 @@ pub struct IndexOptions {
 pub struct IndexReport {
     pub roots: usize,
     pub roots_missing: usize,
+    /// Absent roots whose rows `prune` deleted.
+    pub roots_pruned: usize,
     pub scanned: usize,
     pub unchanged: usize,
     pub added: usize,
@@ -84,7 +90,11 @@ impl std::fmt::Display for IndexReport {
             self.chunks,
             self.links_unresolved,
             self.elapsed_ms
-        )
+        )?;
+        if self.roots_pruned > 0 {
+            write!(f, "; {} absent roots pruned", self.roots_pruned)?;
+        }
+        Ok(())
     }
 }
 
@@ -96,7 +106,7 @@ impl std::fmt::Display for IndexReport {
 /// Returns an error if the database cannot be written.
 pub fn reindex_root_containing(config: &Config, store: &mut Store, path: &Path) -> Result<bool> {
     let file = canonical_file(path);
-    let root = roots::expand(&config.roots, &config.project_aliases())
+    let root = roots::expand_config(config)
         .into_iter()
         .find(|r| file.starts_with(canonical_dir(&r.path)));
     let Some(root) = root else {
@@ -106,9 +116,9 @@ pub fn reindex_root_containing(config: &Config, store: &mut Store, path: &Path) 
         config,
         store,
         &IndexOptions {
-            full: false,
             quiet: true,
             only_root: Some(root.path),
+            ..IndexOptions::default()
         },
     )?;
     Ok(true)
@@ -137,7 +147,7 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
     let mut report = IndexReport::default();
 
     let aliases = config.project_aliases();
-    let expanded = roots::expand(&config.roots, &aliases);
+    let expanded = roots::expand_config(config);
     let selected: Vec<&Root> = expanded
         .iter()
         .filter(|r| opts.only_root.as_ref().is_none_or(|p| &r.path == p))
@@ -161,10 +171,25 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
         .conn_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let known_roots = known_root_paths(&tx)?;
-    report.roots_missing = known_roots
-        .iter()
-        .filter(|p| !expanded.iter().any(|r| &r.path == *p))
-        .count();
+    for path in &known_roots {
+        let present = expanded.iter().any(|r| &r.path == path);
+        let stored = path.to_string_lossy();
+        if present {
+            tx.execute(
+                "UPDATE roots SET present = 1 WHERE path = ?1 AND present = 0",
+                params![stored],
+            )?;
+        } else if opts.prune {
+            prune_root(&tx, &stored)?;
+            report.roots_pruned += 1;
+        } else {
+            tx.execute(
+                "UPDATE roots SET present = 0 WHERE path = ?1 AND present = 1",
+                params![stored],
+            )?;
+            report.roots_missing += 1;
+        }
+    }
 
     for root in selected {
         let (root_id, reparse) = upsert_root(&tx, root)?;
@@ -195,6 +220,19 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
 
     report.elapsed_ms = started.elapsed().as_millis();
     Ok(report)
+}
+
+/// Delete a root and everything indexed under it. The `FTS` rows go first:
+/// the contentless table has no foreign key to cascade through.
+fn prune_root(tx: &Transaction<'_>, path: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (
+             SELECT c.id FROM chunks c JOIN docs d ON d.id = c.doc_id
+             JOIN roots r ON r.id = d.root_id WHERE r.path = ?1)",
+        params![path],
+    )?;
+    tx.execute("DELETE FROM roots WHERE path = ?1", params![path])?;
+    Ok(())
 }
 
 fn known_root_paths(tx: &Transaction<'_>) -> Result<Vec<PathBuf>> {

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::brief;
-use crate::config::{Config, expand_tilde};
+use crate::config::{Config, GLOBAL_SESSIONS_DIR, expand_tilde};
 use crate::error::{Error, Result};
 use crate::pack;
 use crate::store::Store;
@@ -54,6 +54,27 @@ pub struct Transcript {
     pub prompts: usize,
     /// Path as the tool call gave it → counts.
     pub files: BTreeMap<String, Touch>,
+    /// File tool calls, shell commands and assistant text, in order.
+    pub actions: Vec<Action>,
+}
+
+/// One thing the assistant did, kept so the query log can tell which search
+/// results were used afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action {
+    /// Timestamp of the record, as written.
+    pub at: Option<String>,
+    pub kind: ActionKind,
+    /// The file path, the command, or the text.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    /// A file tool read or edited the path.
+    File,
+    Shell,
+    Said,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +164,7 @@ fn session_dir(config: &Config, project_dir: &Path, project: Option<&str>) -> Pa
     if anchor.is_some_and(|p| p.is_dir()) {
         project_dir.join(rel)
     } else {
-        expand_tilde(&config.capture.fallback_dir).join(project.unwrap_or("_global"))
+        expand_tilde(&config.capture.fallback_dir).join(project.unwrap_or(GLOBAL_SESSIONS_DIR))
     }
 }
 
@@ -349,11 +370,16 @@ pub fn scan_line(line: &str, t: &mut Transcript) {
             if let Value::Array(blocks) = &msg.content {
                 for b in blocks {
                     if b["type"] == "tool_use" {
-                        record_tool(b, t);
+                        record_tool(b, rec.timestamp.as_deref(), t);
                     }
                 }
                 let text = text_blocks(blocks);
                 if !text.trim().is_empty() {
+                    t.actions.push(Action {
+                        at: rec.timestamp.clone(),
+                        kind: ActionKind::Said,
+                        text: text.clone(),
+                    });
                     t.last_assistant = Some(text);
                 }
             }
@@ -377,8 +403,21 @@ fn is_prompt(s: &str) -> bool {
     !s.is_empty() && !s.starts_with("<command-") && !s.starts_with("<local-command")
 }
 
-fn record_tool(b: &Value, t: &mut Transcript) {
+fn record_tool(b: &Value, at: Option<&str>, t: &mut Transcript) {
     let input = &b["input"];
+    let mut act = |kind, text: &str| {
+        t.actions.push(Action {
+            at: at.map(str::to_owned),
+            kind,
+            text: text.to_owned(),
+        });
+    };
+    if b["name"] == "Bash" {
+        if let Some(cmd) = input["command"].as_str() {
+            act(ActionKind::Shell, cmd);
+        }
+        return;
+    }
     let (path, edit) = match b["name"].as_str() {
         Some("Edit" | "Write" | "MultiEdit") => (input["file_path"].as_str(), true),
         Some("NotebookEdit") => (input["notebook_path"].as_str(), true),
@@ -388,6 +427,7 @@ fn record_tool(b: &Value, t: &mut Transcript) {
     let Some(path) = path else {
         return;
     };
+    act(ActionKind::File, path);
     let touch = t.files.entry(path.to_owned()).or_default();
     if edit {
         touch.edits += 1;

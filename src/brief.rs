@@ -131,11 +131,11 @@ fn header(store: &Store, project: Option<&str>) -> Result<String> {
         let sql = match project {
             Some(_) => {
                 "SELECT COUNT(*) FROM docs d JOIN roots r ON r.id = d.root_id
-                 WHERE d.active = 1 AND r.kind = ?1 AND r.project = ?2"
+                 WHERE d.active = 1 AND r.present = 1 AND r.kind = ?1 AND r.project = ?2"
             }
             None => {
                 "SELECT COUNT(*) FROM docs d JOIN roots r ON r.id = d.root_id
-                 WHERE d.active = 1 AND r.kind = ?1 AND ?2 IS NULL"
+                 WHERE d.active = 1 AND r.present = 1 AND r.kind = ?1 AND ?2 IS NULL"
             }
         };
         Ok(store
@@ -175,7 +175,9 @@ fn ago(t: jiff::Timestamp) -> String {
 pub fn project_for(store: &Store, cwd: &Path) -> Result<Option<String>> {
     let known: Vec<String> = store
         .conn()
-        .prepare_cached("SELECT DISTINCT project FROM roots WHERE project IS NOT NULL")?
+        .prepare_cached(
+            "SELECT DISTINCT project FROM roots WHERE project IS NOT NULL AND present = 1",
+        )?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<_, _>>()?;
     let aliases = store.project_aliases()?;
@@ -217,7 +219,7 @@ fn pinned(store: &Store, project: Option<&str>) -> Result<Vec<Doc>> {
     };
     let sql = format!(
         "SELECT {DOC_COLUMNS} FROM docs d JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1 AND {scope}
+         WHERE d.active = 1 AND r.present = 1 AND {scope}
            AND (json_extract(d.frontmatter, '$.pinned') = 1
                 OR d.rel_path LIKE '\\_rules/%' ESCAPE '\\'
                 OR d.rel_path LIKE '%/\\_rules/%' ESCAPE '\\')
@@ -258,7 +260,7 @@ fn recent(store: &Store, project: Option<&str>, days: u32) -> Result<Vec<Doc>> {
 fn related(store: &Store, project: &str) -> Result<Vec<Doc>> {
     let sql = format!(
         "WITH here AS (SELECT d.id FROM docs d JOIN roots r ON r.id = d.root_id
-                       WHERE d.active = 1 AND r.project = ?1),
+                       WHERE d.active = 1 AND r.present = 1 AND r.project = ?1),
               hits AS (SELECT l.from_doc_id AS id FROM links l WHERE l.to_doc_id IN here
                        UNION ALL
                        SELECT l.to_doc_id FROM links l
@@ -268,7 +270,7 @@ fn related(store: &Store, project: &str) -> Result<Vec<Doc>> {
                        WHERE t.tag IN (SELECT tag FROM tags WHERE doc_id IN here))
          SELECT {DOC_COLUMNS} FROM hits h
          JOIN docs d ON d.id = h.id JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1 AND d.id NOT IN here
+         WHERE d.active = 1 AND r.present = 1 AND d.id NOT IN here
          GROUP BY d.id
          ORDER BY COUNT(*) DESC, d.updated DESC, d.rel_path
          LIMIT {RELATED_LIMIT}"

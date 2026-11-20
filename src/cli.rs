@@ -29,6 +29,10 @@ pub enum Command {
         /// Only this root path
         #[arg(long)]
         root: Option<String>,
+        /// Drop the index rows of roots that no longer exist (their
+        /// documents are already hidden from results)
+        #[arg(long)]
+        prune: bool,
         #[arg(long, short)]
         quiet: bool,
     },

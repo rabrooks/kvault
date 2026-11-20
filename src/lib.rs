@@ -25,6 +25,7 @@
 //! | [`add`] | write a note into a root and index it |
 //! | [`capture`] | session-note writer used by Stop/`PreCompact` hooks |
 //! | [`hooks`] | Claude Code hook entry points |
+//! | [`querylog`] | local record of searches and which results were used |
 //! | [`cli`] | clap command definitions |
 
 pub mod add;
@@ -40,6 +41,7 @@ pub mod index;
 pub mod list;
 pub mod markdown;
 pub mod pack;
+pub mod querylog;
 pub mod recall;
 pub mod render;
 pub mod roots;

@@ -76,6 +76,7 @@ fn corpus() -> Corpus {
                 ProjectFrom::Parent,
             ),
         ],
+        capture: common::isolated_capture(&base),
         ..Config::default()
     };
     let mut store = Store::open(&base.join("index.db")).unwrap();

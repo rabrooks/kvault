@@ -12,7 +12,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use crate::error::{Error, Result};
 
 /// Current schema version. Bump with every DDL change.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Minimum `SQLite` version: `FTS5` `contentless_delete` arrived in 3.43.0.
 pub const MIN_SQLITE_VERSION: i32 = 3_043_000;
@@ -125,6 +125,14 @@ ALTER TABLE roots ADD COLUMN demote TEXT;
 ALTER TABLE roots ADD COLUMN demote_factor REAL NOT NULL DEFAULT 1.0;
 ";
 
+/// v4: whether the root's directory was there on the last index run. A root
+/// that is gone (unmounted, deleted, dropped from the config) keeps its rows
+/// so its return costs nothing, but its documents are left out of every
+/// result: they could only come back as unreadable hits.
+const MIGRATE_V4: &str = "
+ALTER TABLE roots ADD COLUMN present INTEGER NOT NULL DEFAULT 1;
+";
+
 /// `meta` key holding the configured project aliases as a JSON object,
 /// alias → canonical name. Written by `index` so readers that never load
 /// the config (search, list, brief) resolve names the same way.
@@ -231,6 +239,10 @@ impl Store {
             self.conn.execute_batch(MIGRATE_V3)?;
             current = 3;
         }
+        if current == 3 {
+            self.conn.execute_batch(MIGRATE_V4)?;
+            current = 4;
+        }
         debug_assert_eq!(current, SCHEMA_VERSION);
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -267,12 +279,31 @@ impl Store {
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
         };
         Ok(Counts {
-            roots: count("roots")?,
-            docs: count("docs WHERE active = 1")?,
-            chunks: count("chunks")?,
+            roots: count("roots WHERE present = 1")?,
+            docs: count(
+                "docs WHERE active = 1 AND root_id IN (SELECT id FROM roots WHERE present = 1)",
+            )?,
+            chunks: count(
+                "chunks WHERE doc_id IN (SELECT d.id FROM docs d JOIN roots r ON r.id = d.root_id
+                                         WHERE d.active = 1 AND r.present = 1)",
+            )?,
             links: count("links")?,
             tags: count("tags")?,
         })
+    }
+
+    /// Roots whose directory was gone on the last index run, with how many
+    /// documents each still holds.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn absent_roots(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.path, (SELECT COUNT(*) FROM docs d WHERE d.root_id = r.id AND d.active = 1)
+             FROM roots r WHERE r.present = 0 ORDER BY r.path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Read a `meta` value.
@@ -344,7 +375,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("3"));
+        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("4"));
         let tables: Vec<String> = s
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table') ORDER BY name")

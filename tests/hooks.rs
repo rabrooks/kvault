@@ -232,8 +232,113 @@ fn stop_falls_back_when_the_project_has_no_notes_dir() {
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
     assert!(names[0].ends_with("-abcd0000.md"));
-    // Not under a configured root, so not indexed; the hook still succeeds.
     assert!(!e.fx.base.join("loose/notes").exists());
+    // No root was configured for it, yet the note is indexed under the
+    // project the directory is named for.
+    e.kvault()
+        .args(["list", "--project", "loose"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(names[0].as_str()))
+        .stdout(predicates::str::contains("1 documents"));
+    e.kvault()
+        .args(["search", "WAL mode", "--format", "paths"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "loose/loose/{}",
+            names[0]
+        )));
+}
+
+/// The log lines as `JSON` values.
+fn query_log(e: &Env) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(e.fx.base.join("queries.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn queries_are_logged_and_stop_marks_the_results_that_were_used() {
+    let e = env(None);
+    let cwd = e.fx.base.join("proj-a");
+    for (command, session) in [("recall", Some("sess-0001")), ("search", None)] {
+        let mut cmd = e.kvault();
+        cmd.current_dir(&cwd).args([command, "lambda cold start"]);
+        match session {
+            Some(s) => cmd.env("CLAUDE_CODE_SESSION_ID", s),
+            None => cmd.env_remove("CLAUDE_CODE_SESSION_ID"),
+        };
+        cmd.assert().success();
+    }
+    let log = query_log(&e);
+    assert_eq!(log.len(), 2, "{log:?}");
+    let recall = &log[0];
+    assert_eq!(recall["event"], "query");
+    assert_eq!(recall["command"], "recall");
+    assert_eq!(recall["query"], "lambda cold start");
+    assert_eq!(recall["budget"], 1500);
+    assert_eq!(recall["session"], "sess-0001");
+    assert!(log[1].get("session").is_none(), "run outside a session");
+    let hits = recall["hits"].as_array().unwrap();
+    assert!(hits.len() >= 2, "{hits:?}");
+    let plan = hits
+        .iter()
+        .find(|h| h["path"].as_str().unwrap().ends_with("notes/plan.md"))
+        .unwrap();
+    let fact = hits
+        .iter()
+        .find(|h| h["path"].as_str().unwrap().ends_with("lambda-timeouts.md"))
+        .unwrap();
+
+    // The session then fetches one hit by id and reads the other's file.
+    let t = e.fx.base.join("transcript.jsonl");
+    let later = "2999-01-01T00:00:00.000Z";
+    let lines = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"why is it slow"},
+            "timestamp":"2026-10-28T16:45:30.000Z"}).to_string(),
+        serde_json::json!({"type":"assistant","timestamp":later,"message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"t1","name":"Bash","input":{"command":format!("kvault get {}", fact["id"].as_str().unwrap())}},
+            {"type":"tool_use","id":"t2","name":"Read","input":{"file_path":plan["file"]}}
+        ]}}).to_string(),
+    ];
+    write(&t, &(lines.join("\n") + "\n"));
+    let input = serde_json::json!({"session_id":"sess-0001","cwd":cwd,"transcript_path":t,
+        "last_assistant_message":"done"})
+    .to_string();
+    e.hook("stop", &input);
+    e.hook("stop", &input);
+    assert_eq!(e.log(), "");
+    let mut uses: Vec<(String, String)> = query_log(&e)
+        .iter()
+        .filter(|l| l["event"] == "use")
+        .map(|l| {
+            assert_eq!(l["session"], "sess-0001");
+            assert_eq!(l["query_at"], recall["at"]);
+            (
+                l["id"].as_str().unwrap().to_owned(),
+                l["how"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    uses.sort();
+    let mut expected = vec![
+        (fact["id"].as_str().unwrap().to_owned(), "get".to_owned()),
+        (plan["id"].as_str().unwrap().to_owned(), "file".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(uses, expected, "each use once, however often Stop runs");
+}
+
+#[test]
+fn query_log_can_be_disabled() {
+    let mut e = env(None);
+    e.fx.config.query_log.enabled = false;
+    std::fs::write(&e.config, e.fx.config.to_toml().unwrap()).unwrap();
+    e.kvault().args(["recall", "lambda"]).assert().success();
+    assert!(query_log(&e).is_empty());
 }
 
 #[test]

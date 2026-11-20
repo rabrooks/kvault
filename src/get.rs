@@ -215,7 +215,7 @@ pub fn chunk_by_id(store: &Store, prefix: &str) -> Result<ChunkRef> {
     let sql = format!(
         "SELECT {CHUNK_REF_COLUMNS}
          FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
-         WHERE c.blake3 >= ?1 AND c.blake3 < ?2 AND d.active = 1
+         WHERE c.blake3 >= ?1 AND c.blake3 < ?2 AND d.active = 1 AND r.present = 1
          ORDER BY d.id, c.ordinal"
     );
     let mut stmt = store.conn().prepare_cached(&sql)?;
@@ -250,7 +250,7 @@ pub fn chunk_by_id(store: &Store, prefix: &str) -> Result<ChunkRef> {
 fn all_docs(store: &Store) -> Result<Vec<DocRef>> {
     let mut stmt = store.conn().prepare_cached(
         "SELECT d.id, r.path, r.project, d.rel_path, d.title, d.mtime_ns
-         FROM docs d JOIN roots r ON r.id = d.root_id WHERE d.active = 1",
+         FROM docs d JOIN roots r ON r.id = d.root_id WHERE d.active = 1 AND r.present = 1",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(DocRef {

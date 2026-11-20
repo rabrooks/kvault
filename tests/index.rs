@@ -73,6 +73,10 @@ fn fixture() -> Fixture {
                 )
             },
         ],
+        capture: kvault::config::CaptureConfig {
+            fallback_dir: base.join("sessions").to_string_lossy().into_owned(),
+            ..Default::default()
+        },
         ..Config::default()
     };
     let store = Store::open(&base.join("index.db")).unwrap();
@@ -484,6 +488,82 @@ fn only_root_limits_the_run_and_missing_root_is_not_a_mass_delete() {
         count(&fx.store, "SELECT COUNT(*) FROM docs WHERE active = 1"),
         5
     );
+}
+
+#[test]
+fn absent_root_is_hidden_returns_for_free_and_can_be_pruned() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let listed = |store: &Store| {
+        list::run(store, &ListFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|d| d.rel_path)
+            .collect::<Vec<_>>()
+    };
+    let search = |store: &Store, q: &str| {
+        kvault::search::run(
+            store,
+            &kvault::search::Query::parse(q),
+            &kvault::search::SearchOptions {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .hits
+        .len()
+    };
+    assert_eq!(listed(&fx.store).len(), 5);
+    assert_eq!(search(&fx.store, "kubernetes"), 1);
+
+    // The directory goes away (unmounted, moved, deleted).
+    let gone = fx.base.join("proj-b/notes");
+    let parked = fx.base.join("parked");
+    std::fs::rename(&gone, &parked).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!((r.roots_missing, r.removed), (1, 0));
+    assert_eq!(listed(&fx.store).len(), 4, "its documents are not listed");
+    assert_eq!(search(&fx.store, "kubernetes"), 0, "nor found");
+    assert_eq!(
+        fx.store.absent_roots().unwrap(),
+        vec![(gone.to_string_lossy().into_owned(), 1)]
+    );
+    assert_eq!(fx.store.counts().unwrap().docs, 4);
+    assert_eq!(
+        count(&fx.store, "SELECT COUNT(*) FROM docs WHERE active = 1"),
+        5,
+        "the rows are kept"
+    );
+
+    // It comes back: visible again without re-reading a file.
+    std::fs::rename(&parked, &gone).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!((r.roots_missing, r.added, r.chunks), (0, 0, 0));
+    assert_eq!(search(&fx.store, "kubernetes"), 1);
+    assert!(fx.store.absent_roots().unwrap().is_empty());
+
+    // Gone for good: prune drops the rows, the search index included.
+    std::fs::rename(&gone, &parked).unwrap();
+    let chunks_before = count(&fx.store, "SELECT COUNT(*) FROM chunks");
+    let opts = IndexOptions {
+        prune: true,
+        ..Default::default()
+    };
+    let r = index::run(&fx.config, &mut fx.store, &opts).unwrap();
+    assert_eq!((r.roots_pruned, r.roots_missing), (1, 0));
+    assert!(r.to_string().ends_with("; 1 absent roots pruned"), "{r}");
+    assert_eq!(count(&fx.store, "SELECT COUNT(*) FROM docs"), 4);
+    assert!(count(&fx.store, "SELECT COUNT(*) FROM chunks") < chunks_before);
+    assert_eq!(
+        count(
+            &fx.store,
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'kubernetes'"
+        ),
+        0
+    );
+    assert!(fx.store.absent_roots().unwrap().is_empty());
 }
 
 #[test]

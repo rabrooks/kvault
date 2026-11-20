@@ -19,6 +19,7 @@ use crate::cli::HookEvent;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::{self, IndexOptions};
+use crate::querylog;
 use crate::store::Store;
 
 /// Most stdin bytes a hook reads; Claude Code sends a few hundred.
@@ -108,7 +109,7 @@ fn session_start(
     if matches!(input.source.as_deref(), Some("resume" | "fork")) {
         return Ok(json!({}));
     }
-    if !config.roots.is_empty()
+    if !config.effective_roots().is_empty()
         && let Err(e) = index::run(
             config,
             store,
@@ -152,21 +153,28 @@ fn capture_session(
     input: &HookInput,
     cwd: &Path,
 ) -> Result<Value> {
-    if !config.capture.enabled {
-        return Ok(json!({}));
+    if config.capture.enabled {
+        let written = capture::run(
+            config,
+            store,
+            &CaptureInput {
+                session_id: &input.session_id,
+                cwd,
+                transcript_path: input.transcript_path.as_deref(),
+                last_assistant_message: input.last_assistant_message.as_deref(),
+            },
+        )?;
+        if let Some(path) = written {
+            index::reindex_root_containing(config, store, &path)?;
+        }
     }
-    let written = capture::run(
-        config,
-        store,
-        &CaptureInput {
-            session_id: &input.session_id,
-            cwd,
-            transcript_path: input.transcript_path.as_deref(),
-            last_assistant_message: input.last_assistant_message.as_deref(),
-        },
-    )?;
-    if let Some(path) = written {
-        index::reindex_root_containing(config, store, &path)?;
+    if config.query_log.enabled
+        && let Some(log_path) = Config::query_log_path()
+        && log_path.is_file()
+        && let Some(transcript) = input.transcript_path.as_deref().filter(|p| p.is_file())
+    {
+        let scan = capture::scan_transcript(transcript)?;
+        querylog::mark_used(&log_path, &input.session_id, &scan)?;
     }
     Ok(json!({}))
 }

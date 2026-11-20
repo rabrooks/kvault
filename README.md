@@ -76,8 +76,11 @@ recent_days = 14
 `kvault index` is incremental: files whose mtime and size match are skipped without being
 read; changed files are hashed with BLAKE3 and re-parsed only if the hash differs. A file that
 moves keeps its document id. Deleted files are soft-deleted so a restored file reclaims its id.
-A root that is missing on disk is skipped, never treated as a mass delete. Git ignore files are
-not honoured inside roots (they are often inside ignored directories); a `.kvaultignore` is.
+A root that is missing on disk is skipped, never treated as a mass delete: its documents are
+hidden from every result until the directory is back, which costs nothing. `kvault status`
+lists such roots, and `kvault index --prune` drops their rows when they are gone for good.
+Git ignore files are not honoured inside roots (they are often inside ignored directories); a
+`.kvaultignore` is.
 
 Documents are chunked by heading. Sections over 1,200 tokens split at the best blank line or
 rule, never inside a code fence; sections under 40 tokens merge into the next one. Frontmatter is
@@ -172,13 +175,24 @@ LLM calls and read at most 1 MB of the transcript (the first 128 KB and the last
 The session note is `<project>/notes/sessions/<date>-<session8>.md`, one file per session
 rewritten on every stop, where `<project>` is the nearest ancestor of `cwd` with a `.git`.
 When the project has no `notes/` dir it goes to `[capture] fallback_dir` (default
-`~/.local/share/kvault/sessions/<project>/`), which is only indexed if you add it as a
-root. The note carries `kind: session`, the first prompt (its first line is the title, so
+`~/.local/share/kvault/sessions/<project>/`). Each project directory there is indexed
+without being configured, as an `other` root named for the project. The note carries `kind: session`, the first prompt (its first line is the title, so
 the brief's recent list reads as a log), the last assistant message, and the files the
 transcript shows were read or edited. `<private>…</private>` spans are dropped and
 credential-shaped tokens (PEM blocks, `Bearer x`, AWS, GitHub, Slack, OpenAI, Anthropic
 and Google key prefixes) are replaced with `[redacted]`. Promoting a session note into a
 durable note is the agent's job, through the skill and `kvault add`.
+
+### Query log
+
+Every `search` and `recall` appends one JSON line to `~/.local/state/kvault/queries.jsonl`
+(`KVAULT_QUERY_LOG` overrides; beside the index when `KVAULT_DB` is set): the query, the
+working directory, the Claude Code session, and the ids and files of the results shown.
+The Stop and `PreCompact` hooks then add a `use` line for each result the session went on
+to use: fetched with `kvault get`, read or edited by a file tool, named in a shell
+command, or named in the assistant's text. It is the record of whether retrieval is
+helping, and nothing reads it yet but you (`jq` works). Queries stay on this machine;
+`[query_log] enabled = false` turns it off.
 
 ```
 kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P | --root DIR] [--file F]
@@ -196,7 +210,7 @@ loader's `name`/`description`/`metadata.type` frontmatter and a pointer line is 
 
 ```
 kvault init                                  write config, index
-kvault index [--full] [--root P]             incremental reindex
+kvault index [--full] [--root P] [--prune]   incremental reindex
 kvault search <q> [--project P] [--tag T] [--path G] [--since 30d] [--explain]
 kvault recall <q> --budget N [--project P]   search packed to a token budget (agents call this)
 kvault get <id|path>[:from[:count]]          print a chunk or line window

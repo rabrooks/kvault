@@ -38,7 +38,7 @@ pub fn run(store: &Store, filter: &ListFilter) -> Result<Vec<DocSummary>> {
         "SELECT d.id, r.kind, r.path, r.project, d.rel_path, d.title, d.kind, d.updated,
                 (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id)
          FROM docs d JOIN roots r ON r.id = d.root_id
-         WHERE d.active = 1",
+         WHERE d.active = 1 AND r.present = 1",
     );
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(root) = &filter.root {
