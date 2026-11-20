@@ -5,7 +5,8 @@
 //! printed by `search`, relative to its root, or absolute) equals or ends
 //! with the path part, and, if a `#heading` is given, its heading path
 //! contains the heading. Document-level metrics ignore headings; `sec@5`
-//! counts only cases that name a heading.
+//! counts only cases that name a heading. `tokens` is the mean size of
+//! what `recall` prints for the same queries at its default budget.
 //!
 //! The baseline is what an agent would do without kvault: case-insensitive
 //! grep over every indexed file, ranking files by how many query words they
@@ -17,7 +18,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
+use crate::cli::RecallFormat;
 use crate::error::{Error, Result};
+use crate::recall::{self, RecallOptions};
 use crate::search::{self, Query, SearchOptions, display_path};
 use crate::store::Store;
 
@@ -71,7 +74,13 @@ pub struct Metrics {
     pub mrr: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
+    /// Mean tokens `recall` prints per query at [`RECALL_BUDGET`]: what a
+    /// correct answer costs the agent's context. `None` for the baseline.
+    pub recall_tokens: Option<f64>,
 }
+
+/// The budget `recall` is measured at, its default.
+pub const RECALL_BUDGET: usize = 1500;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct System {
@@ -243,6 +252,7 @@ fn metrics(cases: &[CaseResult]) -> Metrics {
         mrr,
         p50_ms: pct(0.5),
         p95_ms: pct(0.95),
+        recall_tokens: None,
     }
 }
 
@@ -256,6 +266,7 @@ pub fn run(store: &Store, cases: &[Case], opts: &BenchOptions) -> Result<Report>
         ..SearchOptions::default()
     };
     let mut results = Vec::with_capacity(cases.len());
+    let mut recall_tokens = 0usize;
     for case in cases {
         let query = Query::parse(&case.query);
         let start = Instant::now();
@@ -274,10 +285,26 @@ pub fn run(store: &Store, cases: &[Case], opts: &BenchOptions) -> Result<Report>
             })
             .collect();
         results.push(score_case(&case.query, &case.expected, &returned, millis));
+        // Outside the timed region: latency is the search's alone.
+        recall_tokens += recall::run(
+            store,
+            &query,
+            &RecallOptions {
+                budget: RECALL_BUDGET,
+                project: None,
+                format: RecallFormat::Md,
+            },
+        )?
+        .tokens;
     }
+    #[allow(clippy::cast_precision_loss)]
+    let mean_tokens = recall_tokens as f64 / cases.len().max(1) as f64;
     let kvault = System {
         name: "kvault",
-        metrics: metrics(&results),
+        metrics: Metrics {
+            recall_tokens: Some(mean_tokens),
+            ..metrics(&results)
+        },
         cases: results,
     };
     let baseline = if opts.baseline {
@@ -372,8 +399,8 @@ impl Report {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "{:<8} {:>4} {:>6} {:>6} {:>6} {:>12} {:>6} {:>8} {:>8}",
-            "system", "n", "hit@1", "hit@3", "hit@5", "sec@5", "MRR", "p50", "p95"
+            "{:<8} {:>4} {:>6} {:>6} {:>6} {:>12} {:>6} {:>8} {:>8} {:>7}",
+            "system", "n", "hit@1", "hit@3", "hit@5", "sec@5", "MRR", "p50", "p95", "tokens"
         );
         for sys in std::iter::once(&self.kvault).chain(self.baseline.as_ref()) {
             let m = &sys.metrics;
@@ -382,8 +409,18 @@ impl Report {
                 .map_or("-".to_owned(), |(v, n)| format!("{v:.2} (n={n})"));
             let _ = writeln!(
                 out,
-                "{:<8} {:>4} {:>6.2} {:>6.2} {:>6.2} {:>12} {:>6.2} {:>7.1}ms {:>7.1}ms",
-                sys.name, m.n, m.hit1, m.hit3, m.hit5, sec5, m.mrr, m.p50_ms, m.p95_ms
+                "{:<8} {:>4} {:>6.2} {:>6.2} {:>6.2} {:>12} {:>6.2} {:>7.1}ms {:>7.1}ms {:>7}",
+                sys.name,
+                m.n,
+                m.hit1,
+                m.hit3,
+                m.hit5,
+                sec5,
+                m.mrr,
+                m.p50_ms,
+                m.p95_ms,
+                m.recall_tokens
+                    .map_or("-".to_owned(), |t| format!("{t:.0}"))
             );
         }
         if verbose {
