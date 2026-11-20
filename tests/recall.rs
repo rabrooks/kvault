@@ -14,6 +14,11 @@ use kvault::recall::{self, Recall, RecallOptions};
 use kvault::search::Query;
 use predicates::prelude::*;
 
+/// Matches most of the fixture. Written as an explicit expression because
+/// as bare words it is three unrelated topics, which no single note covers
+/// and `recall` would rightly call a weak match.
+const MANY_HITS: &str = "lex: sqlite OR kubernetes OR lambda";
+
 fn run(fx: &Fixture, q: &str, budget: usize) -> Recall {
     run_as(fx, q, budget, RecallFormat::Md)
 }
@@ -49,7 +54,7 @@ fn assert_within(r: &Recall) {
 #[test]
 fn recall_fits_every_budget_and_is_generous_when_it_can_be() {
     let fx = fixture();
-    let q = "sqlite kubernetes lambda";
+    let q = MANY_HITS;
     let total = run(&fx, q, 5000).entries.len();
     assert!(total >= 5, "{total}");
     for budget in [0, 20, 50, 100, 200, 400, 800, 1600, 5000] {
@@ -113,10 +118,67 @@ fn recall_text_is_trimmed_and_tiers_render_as_documented() {
 }
 
 #[test]
+fn a_weak_match_is_shown_as_references_with_a_notice() {
+    let fx = fixture();
+    // One common word of the corpus among terms no note contains.
+    let q = "kubernetes quantum entanglement photon teleportation";
+    let r = run(&fx, q, 1500);
+    assert_within(&r);
+    assert!(r.weak, "coverage {:?}", r.coverage);
+    assert!(r.coverage.unwrap() < recall::WEAK_COVERAGE);
+    assert!(!r.entries.is_empty() && r.entries.len() <= recall::WEAK_SHOWN);
+    assert!(
+        r.entries
+            .iter()
+            .all(|e| e.tier == Tier::L0 && e.text.is_none())
+    );
+    assert!(
+        r.text
+            .contains("\nWeak match: the closest result has about "),
+        "{}",
+        r.text
+    );
+    assert!(r.text.contains("Fetch more: `kvault get <id>`"));
+    assert!(
+        !r.text.contains("horizontal pod autoscaler"),
+        "no chunk text on a weak match:\n{}",
+        r.text
+    );
+    // Still within a budget too small for the notice and five references.
+    for budget in [20, 40, 60, 90] {
+        assert_within(&run(&fx, q, budget));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&run_as(&fx, q, 1500, RecallFormat::Json).text).unwrap();
+    assert!(v["weak_match"].as_f64().unwrap() < recall::WEAK_COVERAGE);
+    assert!(
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["tier"] == "l0")
+    );
+
+    // A query the corpus answers is shown in full, paraphrase or not.
+    for q in ["lambda cold start tuning", "why sqlite instead of tantivy"] {
+        let r = run(&fx, q, 1500);
+        assert!(!r.weak, "{q}: coverage {:?}", r.coverage);
+        assert!(!r.text.contains("Weak match"));
+        assert_eq!(r.entries[0].tier, Tier::L2);
+        let v: serde_json::Value =
+            serde_json::from_str(&run_as(&fx, q, 1500, RecallFormat::Json).text).unwrap();
+        assert!(v.get("weak_match").is_none());
+    }
+    // One word is either there or not: never a weak match.
+    let one = run(&fx, "kubernetes", 1500);
+    assert_eq!((one.weak, one.coverage), (false, None));
+}
+
+#[test]
 fn recall_json_is_budgeted_on_its_own_bytes() {
     let fx = fixture();
     for budget in [20, 150, 400, 1000, 5000] {
-        let r = run_as(&fx, "sqlite kubernetes lambda", budget, RecallFormat::Json);
+        let r = run_as(&fx, MANY_HITS, budget, RecallFormat::Json);
         assert_within(&r);
         if r.text.is_empty() {
             continue;
@@ -129,8 +191,8 @@ fn recall_json_is_budgeted_on_its_own_bytes() {
         assert!(v["entries"][0].get("explain").is_none(), "lean entries");
     }
     // JSON framing costs more than markdown, so it fits fewer entries.
-    let md = run_as(&fx, "sqlite kubernetes lambda", 400, RecallFormat::Md);
-    let json = run_as(&fx, "sqlite kubernetes lambda", 400, RecallFormat::Json);
+    let md = run_as(&fx, MANY_HITS, 400, RecallFormat::Md);
+    let json = run_as(&fx, MANY_HITS, 400, RecallFormat::Json);
     assert!(json.entries.len() <= md.entries.len());
 }
 

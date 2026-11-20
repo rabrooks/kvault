@@ -121,8 +121,11 @@ since it was indexed the output is marked `[stale]`.
 `kvault bench <queries.jsonl> [--baseline] [-v] [--min-hit5 F]` scores hit@1/3/5, section
 hit@5, MRR and latency over a query file (`{"query", "expected": ["path#heading"]}` per line),
 optionally against a case-insensitive grep over the same files. `--min-hit5` makes it a CI
-gate. On a 44-query bench over the real corpus (release build): kvault hit@1 0.95, hit@5 1.00,
-MRR 0.98, p50 1 ms; grep hit@1 0.59, hit@5 0.98, MRR 0.75, p50 10 ms.
+gate. `tokens` is the mean size of what `recall` prints for the same queries. A line with
+`"expected": []` is a question the corpus has no note for: it is left out of the hit rates
+and counted under `quiet` when `recall` finds nothing or calls the match weak; `weak` is the
+share of answerable queries wrongly treated that way. On a 38-query bench over the real
+corpus: kvault hit@1 0.95, hit@5 1.00, MRR 0.97; grep hit@1 0.37, hit@5 0.87, MRR 0.57.
 
 ## Recall and brief
 
@@ -135,6 +138,13 @@ downgrade the remaining previews, and only then drop hits) until the whole outpu
 included, fits. A chunk is shown whole or not at all. The budget applies to the bytes
 printed in whichever format was asked for, as measured by the index's token counter; the
 output ends with the number of hits omitted (counted up to 200) and the `kvault get` hint.
+
+When none of the top three hits contains much of the query (under 45% of its words and
+phrases, weighted so rare ones count more), the note asked for probably does not exist.
+`recall` then prints a "Weak match" notice and up to five one-line references instead of
+chunks about something else: a few hundred tokens instead of the whole budget. Nothing is
+hidden, so an answer worded differently from the query is still listed and one `kvault get`
+away. Single-word queries and `lex:` expressions are never treated as weak.
 
 Shown text is verbatim except for trimming: frontmatter is dropped, trailing whitespace and
 runs of blank lines are collapsed. Nothing inside a line is rewritten, so `path:line`

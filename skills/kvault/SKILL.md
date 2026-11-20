@@ -24,6 +24,10 @@ use, not the question's:
 - `--budget` is tokens of output; 600 for a quick check, 1500 by default, 3000 when
   the answer is probably long
 
+A reply that starts with "Weak match" means no note contains much of your query and
+only references are listed. Usually there is no note on it: say so, or try once more
+with the note's likely vocabulary. If a listed title looks right, `kvault get` it.
+
 Each hit shows an id, a path with line numbers, and either the chunk or a preview.
 `kvault search <q> --explain` shows why a hit ranked where it did when results look
 wrong.

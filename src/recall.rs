@@ -8,6 +8,13 @@
 //! chunk is complete and verbatim apart from [`pack::trim`], so an agent can
 //! quote it; a chunk whose file changed since indexing is never shown in full
 //! because its byte range no longer means anything.
+//!
+//! When none of the top hits contains much of the query, the note the agent
+//! wants probably does not exist, and whole chunks about something else
+//! would only spend its context. Such a weak match is shown as a few
+//! one-line references and a notice instead. Nothing is hidden: a correct
+//! answer worded differently from the query is still listed and one `get`
+//! away.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -29,6 +36,15 @@ pub const PACK_LIMIT: usize = 20;
 pub const COUNT_LIMIT: usize = 200;
 /// Lines of a chunk shown at the preview tier.
 const PREVIEW_LINES: usize = 2;
+/// Top hits whose share of the query decides whether the match is weak.
+pub const COVERAGE_RANKS: usize = 3;
+/// Below this share of the query (see [`search::coverage`]) in every one of
+/// the top hits, the results are probably about something else. Chosen on
+/// a real corpus: queries with no relevant note peaked under it, and nearly
+/// every correct answer, paraphrased ones included, sat above it.
+pub const WEAK_COVERAGE: f64 = 0.45;
+/// References shown for a weak match.
+pub const WEAK_SHOWN: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct RecallOptions {
@@ -64,6 +80,11 @@ pub struct Recall {
     /// Hits found, capped at [`COUNT_LIMIT`].
     pub total: usize,
     pub entries: Vec<Entry>,
+    /// The largest share of the query any top hit contains, when that is
+    /// meaningful; see [`search::coverage`].
+    pub coverage: Option<f64>,
+    /// The match was weak, so only references are shown.
+    pub weak: bool,
     /// Hits that did not fit, best first, as short ids.
     pub omitted: Vec<String>,
     /// The output as printed.
@@ -203,20 +224,41 @@ pub fn run(store: &Store, query: &Query, opts: &RecallOptions) -> Result<Recall>
         .collect();
     let uncounted: Vec<String> = hits.map(|h| h.chunk.id).collect();
 
-    let render = |tiers: &[Option<Tier>]| match opts.format {
-        RecallFormat::Md => render_md(&query.raw, &prepared, tiers, total),
-        RecallFormat::Json => render_json(&query.raw, &prepared, tiers, total, opts),
+    let top: Vec<i64> = prepared
+        .iter()
+        .take(COVERAGE_RANKS)
+        .map(|p| p.hit.chunk.chunk_id)
+        .collect();
+    let coverage = search::coverage(store, query, &top)?.map(|c| c.into_iter().fold(0.0, f64::max));
+    let weak = coverage.is_some_and(|c| c < WEAK_COVERAGE);
+    let frame = Frame {
+        raw: &query.raw,
+        total,
+        budget: opts.budget,
+        weak: weak.then_some(coverage.unwrap_or(0.0)),
     };
-    let packed: Packed = pack::pack(
-        prepared.len(),
-        |i| prepared[i].full.is_some(),
-        Limits {
-            tokens: opts.budget,
-            bytes: None,
-        },
-        &ByteHeuristic,
-        render,
-    );
+    let render = |tiers: &[Option<Tier>]| match opts.format {
+        RecallFormat::Md => render_md(&frame, &prepared, tiers),
+        RecallFormat::Json => render_json(&frame, &prepared, tiers),
+    };
+    let limits = Limits {
+        tokens: opts.budget,
+        bytes: None,
+    };
+    let packed: Packed = if weak {
+        let tiers = (0..prepared.len())
+            .map(|i| (i < WEAK_SHOWN).then_some(Tier::L0))
+            .collect();
+        pack::pack_from(tiers, limits, &ByteHeuristic, render)
+    } else {
+        pack::pack(
+            prepared.len(),
+            |i| prepared[i].full.is_some(),
+            limits,
+            &ByteHeuristic,
+            render,
+        )
+    };
     let mut entries = Vec::new();
     let mut omitted = Vec::new();
     for (p, tier) in prepared.iter().zip(&packed.tiers) {
@@ -231,6 +273,8 @@ pub fn run(store: &Store, query: &Query, opts: &RecallOptions) -> Result<Recall>
         budget: opts.budget,
         tokens: packed.tokens,
         total,
+        coverage,
+        weak,
         entries,
         omitted,
         text: packed.text,
@@ -260,7 +304,17 @@ fn omitted_label(total: usize, shown: usize) -> String {
     }
 }
 
-fn render_md(raw: &str, prepared: &[Prepared], tiers: &[Option<Tier>], total: usize) -> String {
+/// What every rendering of one recall shares.
+struct Frame<'a> {
+    raw: &'a str,
+    total: usize,
+    budget: usize,
+    /// The best share of the query found, when the match is weak.
+    weak: Option<f64>,
+}
+
+fn render_md(frame: &Frame<'_>, prepared: &[Prepared], tiers: &[Option<Tier>]) -> String {
+    let (raw, total) = (frame.raw, frame.total);
     let shown = tiers.iter().flatten().count();
     let mut out = String::new();
     if total == 0 {
@@ -273,6 +327,14 @@ fn render_md(raw: &str, prepared: &[Prepared], tiers: &[Option<Tier>], total: us
         total.to_string()
     };
     let _ = writeln!(out, "## recall \"{raw}\" ({shown} of {total_label} hits)\n");
+    if let Some(share) = frame.weak {
+        let _ = writeln!(
+            out,
+            "Weak match: the closest result has about {:.0}% of the query, so there may be no \
+             note on this. References only; rephrase, or `kvault get <id>` to check one.\n",
+            share * 100.0
+        );
+    }
     for (p, tier) in prepared.iter().zip(tiers) {
         if let Some(tier) = tier {
             p.render_md(*tier, &mut out);
@@ -290,26 +352,25 @@ struct JsonOut<'a> {
     query: &'a str,
     budget: usize,
     total: usize,
+    /// Present on a weak match: the best share of the query found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weak_match: Option<f64>,
     entries: Vec<Entry>,
     omitted: usize,
 }
 
-fn render_json(
-    raw: &str,
-    prepared: &[Prepared],
-    tiers: &[Option<Tier>],
-    total: usize,
-    opts: &RecallOptions,
-) -> String {
+fn render_json(frame: &Frame<'_>, prepared: &[Prepared], tiers: &[Option<Tier>]) -> String {
+    let total = frame.total;
     let entries: Vec<Entry> = prepared
         .iter()
         .zip(tiers)
         .filter_map(|(p, t)| t.map(|t| p.entry(t)))
         .collect();
     let out = JsonOut {
-        query: raw,
-        budget: opts.budget,
+        query: frame.raw,
+        budget: frame.budget,
         total,
+        weak_match: frame.weak.map(|w| (w * 100.0).round() / 100.0),
         omitted: total - entries.len(),
         entries,
     };

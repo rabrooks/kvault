@@ -8,6 +8,11 @@
 //! counts only cases that name a heading. `tokens` is the mean size of
 //! what `recall` prints for the same queries at its default budget.
 //!
+//! A case with an empty `expected` list is a question the corpus has no
+//! note for. It is left out of the hit rates and scored on whether `recall`
+//! stays quiet: no hits, or a weak match shown as references only. `weak`
+//! is the opposite error, an answerable query treated as a weak match.
+//!
 //! The baseline is what an agent would do without kvault: case-insensitive
 //! grep over every indexed file, ranking files by how many query words they
 //! contain and then by total occurrences.
@@ -61,6 +66,12 @@ pub struct CaseResult {
     /// Top three paths returned, for diagnosing misses.
     pub top: Vec<String>,
     pub millis: f64,
+    /// The case expects an answer.
+    pub answerable: bool,
+    /// `recall` found nothing or reported a weak match.
+    pub quiet: bool,
+    /// Best share of the query in the top hits, when meaningful.
+    pub coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +88,11 @@ pub struct Metrics {
     /// Mean tokens `recall` prints per query at [`RECALL_BUDGET`]: what a
     /// correct answer costs the agent's context. `None` for the baseline.
     pub recall_tokens: Option<f64>,
+    /// Share of answerable cases `recall` treated as a weak match.
+    pub weak: Option<f64>,
+    /// Share of no-answer cases on which `recall` stayed quiet, with their
+    /// count.
+    pub quiet: Option<(f64, usize)>,
 }
 
 /// The budget `recall` is measured at, its default.
@@ -109,13 +125,6 @@ pub fn load(path: &Path) -> Result<Vec<Case>> {
         }
         let case: Case = serde_json::from_str(line)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}:{}: {e}", path.display(), i + 1)))?;
-        if case.expected.is_empty() {
-            return Err(Error::Other(anyhow::anyhow!(
-                "{}:{}: expected list is empty",
-                path.display(),
-                i + 1
-            )));
-        }
         cases.push(case);
     }
     if cases.is_empty() {
@@ -205,11 +214,16 @@ fn score_case(query: &str, expected: &[String], returned: &[Returned], millis: f
             .filter_map(|r| r.paths.first().cloned())
             .collect(),
         millis,
+        answerable: !expected.is_empty(),
+        quiet: false,
+        coverage: None,
     }
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn metrics(cases: &[CaseResult]) -> Metrics {
+fn metrics(all: &[CaseResult]) -> Metrics {
+    let cases: Vec<&CaseResult> = all.iter().filter(|c| c.answerable).collect();
+    let unanswerable: Vec<&CaseResult> = all.iter().filter(|c| !c.answerable).collect();
     let n = cases.len().max(1) as f64;
     let hit_at = |k: usize| {
         cases
@@ -224,7 +238,11 @@ fn metrics(cases: &[CaseResult]) -> Metrics {
         .map(|r| 1.0 / r as f64)
         .sum::<f64>()
         / n;
-    let with_heading: Vec<&CaseResult> = cases.iter().filter(|c| c.sec_rank.is_some()).collect();
+    let with_heading: Vec<&CaseResult> = cases
+        .iter()
+        .copied()
+        .filter(|c| c.sec_rank.is_some())
+        .collect();
     let sec5 = (!with_heading.is_empty()).then(|| {
         let hits = with_heading
             .iter()
@@ -253,6 +271,11 @@ fn metrics(cases: &[CaseResult]) -> Metrics {
         p50_ms: pct(0.5),
         p95_ms: pct(0.95),
         recall_tokens: None,
+        weak: None,
+        quiet: (!unanswerable.is_empty()).then(|| {
+            let quiet = unanswerable.iter().filter(|c| c.quiet).count();
+            (quiet as f64 / unanswerable.len() as f64, unanswerable.len())
+        }),
     }
 }
 
@@ -284,9 +307,9 @@ pub fn run(store: &Store, cases: &[Case], opts: &BenchOptions) -> Result<Report>
                 heading_path: h.chunk.heading_path.clone(),
             })
             .collect();
-        results.push(score_case(&case.query, &case.expected, &returned, millis));
+        let mut result = score_case(&case.query, &case.expected, &returned, millis);
         // Outside the timed region: latency is the search's alone.
-        recall_tokens += recall::run(
+        let packed = recall::run(
             store,
             &query,
             &RecallOptions {
@@ -294,15 +317,26 @@ pub fn run(store: &Store, cases: &[Case], opts: &BenchOptions) -> Result<Report>
                 project: None,
                 format: RecallFormat::Md,
             },
-        )?
-        .tokens;
+        )?;
+        result.quiet = packed.weak || packed.total == 0;
+        result.coverage = packed.coverage;
+        if result.answerable {
+            recall_tokens += packed.tokens;
+        }
+        results.push(result);
     }
+    let answerable = results.iter().filter(|c| c.answerable).count();
     #[allow(clippy::cast_precision_loss)]
-    let mean_tokens = recall_tokens as f64 / cases.len().max(1) as f64;
+    let (mean_tokens, weak) = (
+        recall_tokens as f64 / answerable.max(1) as f64,
+        results.iter().filter(|c| c.answerable && c.quiet).count() as f64
+            / answerable.max(1) as f64,
+    );
     let kvault = System {
         name: "kvault",
         metrics: Metrics {
             recall_tokens: Some(mean_tokens),
+            weak: Some(weak),
             ..metrics(&results)
         },
         cases: results,
@@ -387,7 +421,10 @@ fn grep_baseline(store: &Store, cases: &[Case], limit: usize) -> Result<System> 
     }
     Ok(System {
         name: "grep",
-        metrics: metrics(&results),
+        metrics: Metrics {
+            quiet: None,
+            ..metrics(&results)
+        },
         cases: results,
     })
 }
@@ -399,8 +436,19 @@ impl Report {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "{:<8} {:>4} {:>6} {:>6} {:>6} {:>12} {:>6} {:>8} {:>8} {:>7}",
-            "system", "n", "hit@1", "hit@3", "hit@5", "sec@5", "MRR", "p50", "p95", "tokens"
+            "{:<8} {:>4} {:>6} {:>6} {:>6} {:>12} {:>6} {:>8} {:>8} {:>7} {:>5} {:>12}",
+            "system",
+            "n",
+            "hit@1",
+            "hit@3",
+            "hit@5",
+            "sec@5",
+            "MRR",
+            "p50",
+            "p95",
+            "tokens",
+            "weak",
+            "quiet"
         );
         for sys in std::iter::once(&self.kvault).chain(self.baseline.as_ref()) {
             let m = &sys.metrics;
@@ -409,7 +457,7 @@ impl Report {
                 .map_or("-".to_owned(), |(v, n)| format!("{v:.2} (n={n})"));
             let _ = writeln!(
                 out,
-                "{:<8} {:>4} {:>6.2} {:>6.2} {:>6.2} {:>12} {:>6.2} {:>7.1}ms {:>7.1}ms {:>7}",
+                "{:<8} {:>4} {:>6.2} {:>6.2} {:>6.2} {:>12} {:>6.2} {:>7.1}ms {:>7.1}ms {:>7} {:>5} {:>12}",
                 sys.name,
                 m.n,
                 m.hit1,
@@ -420,12 +468,38 @@ impl Report {
                 m.p50_ms,
                 m.p95_ms,
                 m.recall_tokens
-                    .map_or("-".to_owned(), |t| format!("{t:.0}"))
+                    .map_or("-".to_owned(), |t| format!("{t:.0}")),
+                m.weak.map_or("-".to_owned(), |w| format!("{w:.2}")),
+                m.quiet
+                    .map_or("-".to_owned(), |(v, n)| format!("{v:.2} (n={n})"))
             );
         }
         if verbose {
             for sys in std::iter::once(&self.kvault).chain(self.baseline.as_ref()) {
                 for c in &sys.cases {
+                    let share = c
+                        .coverage
+                        .map_or("-".to_owned(), |v| format!("{:.0}%", v * 100.0));
+                    if !c.answerable {
+                        if sys.name == "kvault" && !c.quiet {
+                            let _ = writeln!(
+                                out,
+                                "{:<9} {:<7} {:?}  has {share} of the query  top: {}",
+                                "NOT-QUIET",
+                                sys.name,
+                                c.query,
+                                c.top.join(", ")
+                            );
+                        }
+                        continue;
+                    }
+                    if c.quiet {
+                        let _ = writeln!(
+                            out,
+                            "{:<9} {:<7} {:?}  has {share} of the query",
+                            "WEAK", sys.name, c.query
+                        );
+                    }
                     let doc_ok = c.doc_rank.is_some_and(|r| r <= 5);
                     let sec_ok = c.sec_rank.is_none_or(|s| s.is_some_and(|r| r <= 5));
                     if doc_ok && sec_ok {
@@ -500,8 +574,9 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(load(&p).map(|c| c.len()).ok(), Some(1));
+        // An empty list is a case with no answer in the corpus.
         std::fs::write(&p, "{\"query\":\"a\",\"expected\":[]}\n").unwrap_or_else(|e| panic!("{e}"));
-        assert!(load(&p).is_err());
+        assert_eq!(load(&p).map(|c| c.len()).ok(), Some(1));
         std::fs::write(&p, "not json\n").unwrap_or_else(|e| panic!("{e}"));
         assert!(load(&p).is_err());
     }

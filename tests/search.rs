@@ -351,11 +351,12 @@ fn bench_scores_fixture_and_beats_grep() {
             "{\"query\": \"why sqlite instead of tantivy\", \"expected\": [\"decision-one.md\"]}\n",
             "{\"query\": \"pod autoscaler\", \"expected\": [\"proj-b/notes/other.md\"]}\n",
             "{\"query\": \"architecture storage\", \"expected\": [\"sub/arch.md\"]}\n",
+            "{\"query\": \"kubernetes quantum entanglement photon teleportation\", \"expected\": []}\n",
         ),
     )
     .unwrap();
     let cases = kvault::bench::load(&q).unwrap();
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 5);
     let report = kvault::bench::run(
         &fx.store,
         &cases,
@@ -366,7 +367,10 @@ fn bench_scores_fixture_and_beats_grep() {
     )
     .unwrap();
     let m = &report.kvault.metrics;
-    assert_eq!(m.n, 4);
+    assert_eq!(m.n, 4, "the no-answer case is not part of the hit rates");
+    assert_eq!(m.quiet, Some((1.0, 1)), "recall stays quiet on it");
+    assert_eq!(m.weak, Some(0.0), "and loud on the answerable ones");
+    assert!(m.recall_tokens.unwrap() > 0.0);
     assert!((m.hit5 - 1.0).abs() < f64::EPSILON, "{m:?}");
     assert_eq!(m.sec5, Some((1.0, 1)));
     assert!(m.mrr > 0.9, "{m:?}");

@@ -86,7 +86,7 @@ pub fn pack(
     counter: &impl TokenCounter,
     render: impl Fn(&[Option<Tier>]) -> String,
 ) -> Packed {
-    let mut tiers: Vec<Option<Tier>> = (0..n)
+    let tiers: Vec<Option<Tier>> = (0..n)
         .map(|i| {
             Some(if i < FULL_RANKS && has_full(i) {
                 Tier::L2
@@ -97,6 +97,18 @@ pub fn pack(
             })
         })
         .collect();
+    pack_from(tiers, limits, counter, render)
+}
+
+/// Fit a starting tier assignment into `limits`, shedding detail in the
+/// same order as [`pack`]. For callers that decide the most any item may
+/// show themselves.
+pub fn pack_from(
+    mut tiers: Vec<Option<Tier>>,
+    limits: Limits,
+    counter: &impl TokenCounter,
+    render: impl Fn(&[Option<Tier>]) -> String,
+) -> Packed {
     let fits = |text: &str, tokens: usize| {
         tokens <= limits.tokens && limits.bytes.is_none_or(|b| text.len() <= b)
     };

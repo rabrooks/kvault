@@ -495,6 +495,60 @@ pub struct SearchResult {
     pub candidates: usize,
 }
 
+/// For each chunk, the share of the query it contains: its positive units
+/// (words and phrases) found anywhere in the chunk's indexed text, each
+/// weighted by how rare it is, so missing `the` costs little and missing
+/// the one distinctive word costs a lot. In `[0, 1]`.
+///
+/// `None` when the share says nothing: fewer than two units (one word is
+/// either there or the chunk would not have matched) or a raw `lex:`
+/// expression.
+///
+/// # Errors
+/// Returns an error if the index cannot be queried.
+pub fn coverage(store: &Store, query: &Query, chunk_ids: &[i64]) -> Result<Option<Vec<f64>>> {
+    if query.lexical.is_some() || query.positive.len() < 2 || chunk_ids.is_empty() {
+        return Ok(None);
+    }
+    let conn = store.conn();
+    #[allow(clippy::cast_precision_loss)]
+    let total = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))? as f64;
+    let ids = chunk_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut count = conn
+        .prepare_cached("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?1")
+        .map_err(fts_error)?;
+    let mut among = conn
+        .prepare(&format!(
+            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 AND rowid IN ({ids})"
+        ))
+        .map_err(fts_error)?;
+    let mut found = vec![0.0; chunk_ids.len()];
+    let mut all = 0.0;
+    for unit in &query.positive {
+        let expr = unit.fts();
+        #[allow(clippy::cast_precision_loss)]
+        let containing = count
+            .query_row([&expr], |r| r.get::<_, i64>(0))
+            .map_err(fts_error)? as f64;
+        let weight = (1.0 + total / (1.0 + containing)).ln();
+        all += weight;
+        let rows = among
+            .query_map([&expr], |r| r.get::<_, i64>(0))
+            .map_err(fts_error)?;
+        for id in rows {
+            let id = id.map_err(fts_error)?;
+            if let Some(i) = chunk_ids.iter().position(|c| *c == id) {
+                found[i] += weight;
+            }
+        }
+    }
+    Ok((all > 0.0).then(|| found.into_iter().map(|f| f / all).collect()))
+}
+
 /// `[project/]<root dir name>/<rel_path>`.
 #[must_use]
 pub fn display_path(root_path: &str, project: Option<&str>, rel_path: &str) -> String {
