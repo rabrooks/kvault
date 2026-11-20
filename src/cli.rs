@@ -20,6 +20,16 @@ pub enum Command {
         /// Overwrite an existing config
         #[arg(long)]
         force: bool,
+        /// A notes directory, or a quoted glob of them such as
+        /// '~/code/*/notes'. Repeat for several. Added alongside the
+        /// usual locations that exist
+        #[arg(long, value_name = "PATH")]
+        notes: Vec<String>,
+    },
+    /// Change which directories are indexed
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
     },
     /// Incrementally (re)index all configured roots
     Index {
@@ -146,6 +156,44 @@ pub enum Command {
     /// Start the MCP stdio server
     #[cfg(feature = "mcp")]
     Serve,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RootCommand {
+    /// Add a directory (or a quoted glob of directories) to the config and
+    /// index it
+    Add {
+        path: String,
+        #[arg(long, value_enum, default_value_t = KindArg::Notes)]
+        kind: KindArg,
+        /// How files under it get their project name; worked out from the
+        /// path when omitted
+        #[arg(long, value_enum)]
+        project_from: Option<ProjectFromArg>,
+        /// Ranking weight; 1.0 is neutral
+        #[arg(long)]
+        weight: Option<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum KindArg {
+    Notes,
+    Memory,
+    Reference,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum ProjectFromArg {
+    /// The directory above the root: `<project>/notes`
+    Parent,
+    /// The root's own name
+    Dir,
+    /// A Claude Code memory directory
+    ClaudeSlug,
+    /// No project
+    None,
 }
 
 #[derive(Debug, Args)]

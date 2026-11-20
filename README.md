@@ -7,7 +7,7 @@ MCP adapter.
 
 ## Status
 
-**0.2.0-beta.1, in trial use.** Indexing, search, budgeted recall, the session brief, the
+**0.2.0-beta.2, in trial use.** Indexing, search, budgeted recall, the session brief, the
 Claude Code hooks and skill, session capture, `add`, the query log and `report` all work.
 Two commands are declared but not built, and exit with code 3 saying so: `links` (link
 neighbours of a note) and `serve` (an MCP stdio adapter, behind `--features mcp`). Links
@@ -36,15 +36,38 @@ Requires Rust 1.95 (pinned in `rust-toolchain.toml`; `rustup` picks it up).
 ```bash
 git clone https://github.com/rabrooks/kvault && cd kvault
 cargo install --path .        # puts `kvault` on PATH (~/.cargo/bin)
-kvault init                   # writes the config with the roots that exist, then indexes
+kvault init                   # writes the config, then indexes
 kvault status                 # roots found, document counts
 kvault recall "something you know is in your notes"
-claude --plugin-dir "$PWD"    # a Claude Code session with the hooks and the skill
 ```
 
-`kvault init` looks for Claude Code memory dirs (`~/.claude/projects/*/memory`), project
-notes (`~/Projects/*/notes`) and `~/Projects/notes`. If your notes live elsewhere, edit the
-config (next section) and run `kvault index`. Nothing is uploaded anywhere. kvault never
+`kvault init` always configures Claude Code's memory dirs (`~/.claude/projects/*/memory`)
+and adds `~/Projects/*/notes` and `~/Projects/notes` when they exist. Tell it where your
+notes are if that is somewhere else, at init or any time after:
+
+```bash
+kvault init --notes '~/code/*/notes' --notes ~/Documents/notes   # quote globs
+kvault root add ~/work/handbook                                  # later additions
+kvault root add '~/vaults/*' --kind reference --weight 0.8
+```
+
+`root add` appends to the config without touching what is there and reindexes. Each
+project's name is worked out from the path: a `notes` or `docs` directory, or any fixed
+name under a glob, belongs to the directory above it (`~/code/app/notes` is project `app`);
+anything else is its own project (`~/work/handbook` is `handbook`). `--project-from
+parent|dir|none` overrides that.
+
+Then give Claude Code the hooks and the skill. Install the binary first: the plugin only
+carries the hook definitions and the skill, and its hooks call `kvault` from `PATH`.
+
+```
+/plugin marketplace add rabrooks/kvault
+/plugin install kvault@kvault
+```
+
+or, for a single session without installing, `claude --plugin-dir <path to this clone>`.
+
+Nothing is uploaded anywhere. kvault never
 moves or rewrites your notes: the only files it writes are session notes, notes you `add`,
 and the pointer line `add` appends to `MEMORY.md` in a Claude Code memory dir.
 
@@ -94,8 +117,9 @@ recent_days = 14
 enabled = true
 ```
 
-`kvault init` writes the first three roots for you (only those that exist on disk) and runs
-the first index. `kind` is `memory`, `notes`, `reference` or `other`. `project_from` names
+`kvault init` writes the memory root and whichever of the other two exist, plus any
+`--notes` you pass, and runs the first index; `kvault root add <path>` appends one later.
+`kind` is `memory`, `notes`, `reference` or `other`. `project_from` names
 the project a root's files belong to: `parent` (the directory above, for `<project>/notes`),
 `dir` (the root's own name), `claude_slug` (a Claude Code memory dir), or `none`. The
 project is what `--project` filters on and how the brief knows which notes are "here";
@@ -195,15 +219,12 @@ runs except the counts and a coarse index age at its end.
 
 ## Claude Code integration
 
-The repository is also a Claude Code plugin: `hooks/hooks.json`, `skills/kvault/SKILL.md`
-and `.claude-plugin/plugin.json`. With the binary on `PATH`:
-
-```bash
-claude --plugin-dir ~/Projects/kvault        # try it for one session
-```
-
-or copy the three hook entries into `~/.claude/settings.json` and the skill directory into
-`~/.claude/skills/`. The hooks:
+The repository is also a Claude Code plugin (`hooks/hooks.json`, `skills/kvault/SKILL.md`,
+`.claude-plugin/plugin.json`) and its own single-plugin marketplace
+(`.claude-plugin/marketplace.json`). With the binary on `PATH`, install it as shown in the
+quick start, run one session with `claude --plugin-dir <clone>`, or copy the three hook
+entries into `~/.claude/settings.json` and the skill directory into `~/.claude/skills/`.
+The hooks:
 
 | Event | Command | What it does |
 |---|---|---|
@@ -265,7 +286,8 @@ log lines themselves, which do contain query text and file paths: read it before
 ## CLI
 
 ```
-kvault init                                  write config, index
+kvault init [--notes PATH]...                write config, index
+kvault root add <path> [--kind K]            add a directory to the config, index
 kvault index [--full] [--root P] [--prune]   incremental reindex
 kvault search <q> [--project P] [--tag T] [--path G] [--since 30d] [--explain]
 kvault recall <q> --budget N [--project P]   search packed to a token budget (agents call this)

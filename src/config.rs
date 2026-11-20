@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -109,6 +110,50 @@ impl RootConfig {
             demote_factor: default_demote_factor(),
         }
     }
+}
+
+impl ProjectFrom {
+    /// The value as written in the config file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Parent => "parent",
+            Self::ClaudeSlug => "claude_slug",
+            Self::Dir => "dir",
+        }
+    }
+
+    /// The likely meaning of a notes path nobody annotated. A `notes` or
+    /// `docs` directory belongs to the project above it
+    /// (`~/code/*/notes`, `~/code/app/docs`), and so does any fixed name
+    /// under a glob; anything else (`~/work/handbook`, `~/vaults/*`) is
+    /// itself the project.
+    #[must_use]
+    pub fn infer(pattern: &str) -> Self {
+        let trimmed = pattern.trim_end_matches('/');
+        let (parent, last) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        let is_glob = |s: &str| s.contains(['*', '?', '[']);
+        if is_glob(last) {
+            Self::Dir
+        } else if is_glob(parent) || matches!(last, "notes" | "docs") {
+            Self::Parent
+        } else {
+            Self::Dir
+        }
+    }
+}
+
+/// `~/x` for a path under the home directory, so a config written on one
+/// machine reads the same on another; other paths unchanged.
+#[must_use]
+pub fn contract_tilde(path: &Path) -> String {
+    if let Some(base) = BaseDirs::new()
+        && let Ok(rest) = path.strip_prefix(base.home_dir())
+    {
+        return format!("~/{}", rest.to_string_lossy());
+    }
+    path.to_string_lossy().into_owned()
 }
 
 /// Strategy for naming the project a root's files belong to.
@@ -319,24 +364,76 @@ impl Config {
         Self::hook_log_path().map(|p| p.with_file_name("queries.jsonl"))
     }
 
-    /// The roots `kvault init` writes when none are configured.
+    /// Claude Code's auto-memory directories, in the same place for
+    /// everyone, so `kvault init` always configures it.
     #[must_use]
-    pub fn suggested_roots() -> Vec<RootConfig> {
+    pub fn memory_root() -> RootConfig {
+        RootConfig {
+            weight: 1.2,
+            ..RootConfig::new(
+                "~/.claude/projects/*/memory",
+                RootKind::Memory,
+                ProjectFrom::ClaudeSlug,
+            )
+        }
+    }
+
+    /// Where notes often are; `kvault init` configures those that exist.
+    #[must_use]
+    pub fn suggested_notes_roots() -> Vec<RootConfig> {
         vec![
-            RootConfig {
-                weight: 1.2,
-                ..RootConfig::new(
-                    "~/.claude/projects/*/memory",
-                    RootKind::Memory,
-                    ProjectFrom::ClaudeSlug,
-                )
-            },
             RootConfig::new("~/Projects/*/notes", RootKind::Notes, ProjectFrom::Parent),
             RootConfig {
                 weight: 0.8,
                 ..RootConfig::new("~/Projects/notes", RootKind::Reference, ProjectFrom::None)
             },
         ]
+    }
+
+    /// Append a root to the config file at `path`, leaving everything
+    /// already in it, comments included, as it was. The file is put back
+    /// if the result does not load.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or written, the root is
+    /// already configured, or the new file is not a valid config.
+    pub fn append_root(path: &Path, root: &RootConfig) -> Result<()> {
+        let before = std::fs::read_to_string(path)?;
+        let existing = Self::load_from(path)?;
+        let same = |a: &str, b: &str| {
+            let norm = |s: &str| -> PathBuf { expand_tilde(s).components().collect() };
+            norm(a) == norm(b)
+        };
+        if existing.roots.iter().any(|r| same(&r.path, &root.path)) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "{} is already a configured root",
+                root.path
+            )));
+        }
+        let quoted = |s: &str| toml::Value::String(s.to_owned()).to_string();
+        let mut block = String::from("\n[[roots]]\n");
+        let _ = writeln!(block, "path = {}", quoted(&root.path));
+        let _ = writeln!(block, "kind = {}", quoted(root.kind.as_str()));
+        if (root.weight - default_weight()).abs() > f64::EPSILON {
+            // Debug formatting keeps the decimal point, so it stays a float.
+            let _ = writeln!(block, "weight = {:?}", root.weight);
+        }
+        let _ = writeln!(
+            block,
+            "project_from = {}",
+            quoted(root.project_from.as_str())
+        );
+        let mut after = before.clone();
+        if !after.is_empty() && !after.ends_with('\n') {
+            after.push('\n');
+        }
+        after.push_str(&block);
+        std::fs::write(path, &after)?;
+        if let Err(e) = Self::load_from(path) {
+            std::fs::write(path, &before)?;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Serialize to `TOML`.
@@ -476,7 +573,9 @@ budget = 1500
     #[test]
     fn suggested_roots_round_trip_through_toml() {
         let c = Config {
-            roots: Config::suggested_roots(),
+            roots: std::iter::once(Config::memory_root())
+                .chain(Config::suggested_notes_roots())
+                .collect(),
             ..Config::default()
         };
         let text = c.to_toml().unwrap();
@@ -491,6 +590,52 @@ budget = 1500
         assert!(cfg.ends_with(".config"));
         let data = xdg_dir("KVAULT_TEST_UNSET_VAR", ".local/share").unwrap();
         assert!(data.ends_with(".local/share"));
+    }
+
+    #[test]
+    fn project_naming_is_inferred_from_the_shape_of_a_path() {
+        for (path, want) in [
+            ("~/code/*/notes", ProjectFrom::Parent),
+            ("~/code/*/design-docs", ProjectFrom::Parent),
+            ("~/code/app/notes", ProjectFrom::Parent),
+            ("~/code/app/docs/", ProjectFrom::Parent),
+            ("~/work/handbook", ProjectFrom::Dir),
+            ("~/vaults/*", ProjectFrom::Dir),
+            ("/srv/wiki", ProjectFrom::Dir),
+        ] {
+            assert_eq!(ProjectFrom::infer(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn append_root_keeps_the_file_and_refuses_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "# my notes\n[[roots]]\npath = \"/a/notes\"\nkind = \"notes\"\n\n\
+                        [brief]\nbudget = 900\n\n# one project, two names\n\
+                        [projects.app]\naliases = [\"work-app\"]";
+        std::fs::write(&path, original).unwrap();
+        let root = RootConfig {
+            weight: 2.0,
+            ..RootConfig::new("/b/hand \"book\"", RootKind::Reference, ProjectFrom::Dir)
+        };
+        Config::append_root(&path, &root).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(original), "nothing rewritten:\n{text}");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.roots.len(), 2);
+        assert_eq!(config.roots[1].path, "/b/hand \"book\"");
+        assert_eq!(config.roots[1].kind, RootKind::Reference);
+        assert_eq!(config.roots[1].project_from, ProjectFrom::Dir);
+        assert!((config.roots[1].weight - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.brief.budget, 900);
+        assert_eq!(config.projects["app"].aliases, vec!["work-app".to_owned()]);
+
+        // The same directory written another way is still the same root.
+        let again = RootConfig::new("/a/notes/", RootKind::Notes, ProjectFrom::Parent);
+        let err = Config::append_root(&path, &again).unwrap_err().to_string();
+        assert!(err.contains("already a configured root"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,13 +7,14 @@ use clap::Parser;
 use kvault::add::AddOptions;
 use kvault::bench::BenchOptions;
 use kvault::brief::BriefOptions;
-use kvault::cli::{Cli, Command, RecallFormat, SearchArgs};
-use kvault::config::{Config, expand_tilde};
+use kvault::cli::{Cli, Command, KindArg, ProjectFromArg, RecallFormat, RootCommand, SearchArgs};
+use kvault::config::{Config, ProjectFrom, RootConfig, contract_tilde, expand_tilde};
 use kvault::error::{Error, Milestone};
 use kvault::index::{self, IndexOptions};
 use kvault::list::{self, ListFilter};
 use kvault::querylog::{self, LoggedHit, NewQuery};
 use kvault::recall::RecallOptions;
+use kvault::roots::RootKind;
 use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
 use kvault::{get, hooks, render, roots};
@@ -54,7 +56,16 @@ fn main() -> ExitCode {
 fn run(command: Command) -> kvault::Result<()> {
     match command {
         Command::Status => status(),
-        Command::Init { force } => init(force),
+        Command::Init { force, notes } => init(force, &notes),
+        Command::Root {
+            command:
+                RootCommand::Add {
+                    path,
+                    kind,
+                    project_from,
+                    weight,
+                },
+        } => root_add(&path, kind, project_from, weight),
         Command::Index {
             full,
             root,
@@ -171,36 +182,129 @@ fn run_index(opts: &IndexOptions) -> kvault::Result<()> {
     Ok(())
 }
 
-fn init(force: bool) -> kvault::Result<()> {
+/// A root for a notes path given on the command line: absolute, `~` kept
+/// short, project naming worked out from its shape.
+fn notes_root(arg: &str) -> kvault::Result<RootConfig> {
+    let expanded = expand_tilde(arg);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()?.join(expanded)
+    };
+    let path = contract_tilde(&absolute.components().collect::<PathBuf>());
+    let project_from = ProjectFrom::infer(&path);
+    Ok(RootConfig::new(path, RootKind::Notes, project_from))
+}
+
+/// `3 dirs: app, site, tools` for a root's expansion.
+fn describe_matches(root: &RootConfig) -> String {
+    let dirs = roots::expand(std::slice::from_ref(root), &BTreeMap::new());
+    if dirs.is_empty() {
+        return "nothing there yet".to_owned();
+    }
+    let mut projects: Vec<String> = dirs.iter().filter_map(|d| d.project.clone()).collect();
+    projects.dedup();
+    let named = match projects.len() {
+        0 => String::new(),
+        1..=4 => format!(": {}", projects.join(", ")),
+        n => format!(": {}, … ({n} projects)", projects[..3].join(", ")),
+    };
+    format!(
+        "{} dir{}{named}",
+        dirs.len(),
+        if dirs.len() == 1 { "" } else { "s" }
+    )
+}
+
+fn init(force: bool, notes: &[String]) -> kvault::Result<()> {
     let path = Config::config_path()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("no config directory available")))?;
     if path.exists() && !force {
         return Err(Error::Other(anyhow::anyhow!(
-            "{} already exists; pass --force to overwrite",
+            "{} already exists; add a directory with `kvault root add <dir>`, \
+             or pass --force to start over",
             path.display()
         )));
     }
     let mut config = Config::default();
-    for root in Config::suggested_roots() {
-        let present = roots::expand(std::slice::from_ref(&root), &config.project_aliases());
-        if present.is_empty() {
-            outln!("skip   {:<32} (no matching directories)", root.path);
+    // Memory dirs appear as Claude Code is used, so the root is configured
+    // whether or not any exist yet.
+    let memory = Config::memory_root();
+    outln!("add    {:<32} ({})", memory.path, describe_matches(&memory));
+    config.roots.push(memory);
+    let mut found_notes = false;
+    for root in Config::suggested_notes_roots() {
+        if roots::expand(std::slice::from_ref(&root), &BTreeMap::new()).is_empty() {
+            outln!("skip   {:<32} (not found)", root.path);
         } else {
-            outln!("add    {:<32} ({} dirs)", root.path, present.len());
+            outln!("add    {:<32} ({})", root.path, describe_matches(&root));
             config.roots.push(root);
+            found_notes = true;
         }
     }
-    if config.roots.is_empty() {
-        return Err(Error::Other(anyhow::anyhow!(
-            "none of the suggested roots exist; write {} by hand",
-            path.display()
-        )));
+    for arg in notes {
+        let root = notes_root(arg)?;
+        if config.roots.iter().any(|r| r.path == root.path) {
+            continue;
+        }
+        outln!("add    {:<32} ({})", root.path, describe_matches(&root));
+        config.roots.push(root);
+        found_notes = true;
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, config.to_toml()?)?;
     outln!("wrote  {}", path.display());
+    run_index(&IndexOptions::default())?;
+    if !found_notes {
+        outln!(
+            "\nNo notes directories were found in the usual places. Add yours with\n  \
+             kvault root add <dir>              one directory of notes\n  \
+             kvault root add '~/code/*/notes'   one per project (quote the glob)"
+        );
+    }
+    Ok(())
+}
+
+fn root_add(
+    arg: &str,
+    kind: KindArg,
+    project_from: Option<ProjectFromArg>,
+    weight: Option<f64>,
+) -> kvault::Result<()> {
+    let path = Config::config_path()
+        .filter(|p| p.exists())
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("no config yet; run `kvault init` first")))?;
+    let mut root = notes_root(arg)?;
+    root.kind = match kind {
+        KindArg::Notes => RootKind::Notes,
+        KindArg::Memory => RootKind::Memory,
+        KindArg::Reference => RootKind::Reference,
+        KindArg::Other => RootKind::Other,
+    };
+    if let Some(p) = project_from {
+        root.project_from = match p {
+            ProjectFromArg::Parent => ProjectFrom::Parent,
+            ProjectFromArg::Dir => ProjectFrom::Dir,
+            ProjectFromArg::ClaudeSlug => ProjectFrom::ClaudeSlug,
+            ProjectFromArg::None => ProjectFrom::None,
+        };
+    }
+    if let Some(w) = weight {
+        root.weight = w;
+    }
+    Config::append_root(&path, &root)?;
+    outln!(
+        "added  {} ({}, project from {}; {})",
+        root.path,
+        root.kind.as_str(),
+        root.project_from.as_str(),
+        describe_matches(&root)
+    );
+    if roots::expand(std::slice::from_ref(&root), &BTreeMap::new()).is_empty() {
+        outln!("       nothing matches yet; it will be indexed once it exists");
+    }
     run_index(&IndexOptions::default())
 }
 

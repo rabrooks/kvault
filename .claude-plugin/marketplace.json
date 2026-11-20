@@ -1,0 +1,17 @@
+{
+  "name": "kvault",
+  "owner": {
+    "name": "Aaron Brooks"
+  },
+  "metadata": {
+    "description": "The kvault repository served as its own single-plugin marketplace."
+  },
+  "plugins": [
+    {
+      "name": "kvault",
+      "source": "./",
+      "description": "Local-first knowledge index for coding agents: session-start brief, session capture, and a skill for searching and saving notes across projects.",
+      "category": "productivity"
+    }
+  ]
+}
