@@ -27,6 +27,12 @@ struct Corpus {
 /// One memory root with an index and two facts, plus a notes root holding
 /// a file that is also called `MEMORY.md` but is not an index.
 fn corpus() -> Corpus {
+    corpus_with("portal-rebuild.md", &[])
+}
+
+/// The corpus with the portal fact at `portal` (relative to the memory
+/// root) and `demote` globs on that root.
+fn corpus_with(portal: &str, demote: &[&str]) -> Corpus {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_path_buf();
     let mem = base.join("mem/-Users-x-Projects-p/memory");
@@ -34,14 +40,16 @@ fn corpus() -> Corpus {
     // query term even though no single fact does.
     write(
         &mem.join("MEMORY.md"),
-        "# Memory Index\n\n\
-         ## Roadmap\n\n\
-         - [Portal rebuild](portal-rebuild.md): candidate portal sends CTM status by name; a rename breaks it\n\
-         - [Replica sizing](replica-sizing.md): the replica drives the SKU, not the primary\n\
-         - [Pager rota](pager-rota.md): who is on call for the vendor bridge this quarter\n",
+        &format!(
+            "# Memory Index\n\n\
+             ## Roadmap\n\n\
+             - [Portal rebuild]({portal}): candidate portal sends CTM status by name; a rename breaks it\n\
+             - [Replica sizing](replica-sizing.md): the replica drives the SKU, not the primary\n\
+             - [Pager rota](pager-rota.md): who is on call for the vendor bridge this quarter\n"
+        ),
     );
     write(
-        &mem.join("portal-rebuild.md"),
+        &mem.join(portal),
         "---\nname: portal-rebuild\ndescription: candidate portal rebuild status\n---\n\n\
          The rebuilt candidate portal sends the CTM status by name rather than by numeric \
          id, so the mapping table must list every status label the vendor emits.\n",
@@ -64,6 +72,7 @@ fn corpus() -> Corpus {
         roots: vec![
             RootConfig {
                 weight: 1.2,
+                demote: demote.iter().map(|g| (*g).to_owned()).collect(),
                 ..RootConfig::new(
                     format!("{}/mem/*/memory", base.display()),
                     RootKind::Memory,
@@ -125,6 +134,37 @@ fn the_fact_outranks_the_index_line_pointing_at_it() {
     );
     assert!(index.explain.rrf < fact.explain.rrf);
     assert!(fact.explain.index_cap.is_none());
+}
+
+/// The cap has to hold on final scores: a demoted fact has a lower authority
+/// than the index pointing at it, which used to put the index back on top.
+#[test]
+fn a_demoted_fact_still_outranks_the_index_line_pointing_at_it() {
+    let c = corpus_with("archive/portal-rebuild.md", &["**/archive/**"]);
+    let hits = search(&c, "CTM status name rename");
+    let at = |path: &str| {
+        display(&hits)
+            .iter()
+            .position(|p| *p == path)
+            .unwrap_or_else(|| panic!("{path} not in {:?}", display(&hits)))
+    };
+    let (fact, index) = (
+        at("p/memory/archive/portal-rebuild.md"),
+        at("p/memory/MEMORY.md"),
+    );
+    assert!(fact < index, "{:?}", display(&hits));
+    let (fact, index) = (&hits[fact], &hits[index]);
+    assert!(fact.explain.demoted.is_some());
+    assert!(fact.explain.authority < index.explain.authority);
+    assert!(index.score < fact.score);
+    assert_eq!(
+        index.explain.index_cap.as_ref().unwrap().below,
+        fact.chunk.id
+    );
+    assert!(
+        (index.score - index.explain.rrf * index.explain.authority).abs() < 1e-12,
+        "explain still adds up"
+    );
 }
 
 #[test]

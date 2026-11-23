@@ -43,11 +43,10 @@ pub fn run(store: &Store, filter: &ListFilter) -> Result<Vec<DocSummary>> {
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(root) = &filter.root {
         sql.push_str(" AND r.path = ?");
-        args.push(Box::new(
-            crate::config::expand_tilde(root)
-                .to_string_lossy()
-                .into_owned(),
-        ));
+        // Roots are stored without a trailing separator.
+        let normalized: std::path::PathBuf =
+            crate::config::expand_tilde(root).components().collect();
+        args.push(Box::new(normalized.to_string_lossy().into_owned()));
     }
     if let Some(kind) = &filter.kind {
         sql.push_str(" AND (r.kind = ? OR d.kind = ?)");

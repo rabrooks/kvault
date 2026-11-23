@@ -386,7 +386,7 @@ fn first_chunks(store: &Store, docs: &[&Doc]) -> Result<HashMap<i64, ChunkRef>> 
 fn line(section: Section, doc: &Doc, chunk: &ChunkRef) -> String {
     let first = get::read_chunk(chunk)
         .ok()
-        .map(|t| pack::trim(&t.text))
+        .map(|t| pack::trim_from(&t.text, t.first_line))
         .and_then(|t| {
             pack::preview(&t, 1)
                 .first()
