@@ -199,9 +199,16 @@ fn local_time(z: &jiff::Zoned) -> String {
 }
 
 fn render(n: &Note<'_>) -> String {
-    let title = n
+    // Scrub before deriving the title or truncating: the title is a prompt
+    // line, and a secret cut short by truncation no longer looks like one.
+    let prompt = n
         .transcript
         .first_prompt
+        .as_deref()
+        .map(scrub)
+        .filter(|p| !p.is_empty());
+    let last = n.last.map(scrub).filter(|l| !l.is_empty());
+    let title = prompt
         .as_deref()
         .and_then(|p| p.lines().find(|l| !l.trim().is_empty()))
         .map_or_else(
@@ -236,21 +243,14 @@ fn render(n: &Note<'_>) -> String {
     out.push_str(&serde_norway::to_string(&fm).unwrap_or_default());
     out.push_str("---\n");
     let _ = writeln!(out, "# {title}");
-    if let Some(p) = &n.transcript.first_prompt {
-        let _ = write!(
-            out,
-            "\n## Prompt\n\n{}\n",
-            redact(&pack::truncate(p.trim(), PROMPT_CHARS))
-        );
+    if let Some(p) = &prompt {
+        let _ = write!(out, "\n## Prompt\n\n{}\n", pack::truncate(p, PROMPT_CHARS));
     }
-    if let Some(last) = n.last {
+    if let Some(last) = &last {
         let _ = write!(
             out,
             "\n## Last response\n\n{}\n",
-            redact(&pack::truncate(
-                strip_private(last).trim(),
-                LAST_MESSAGE_CHARS
-            ))
+            pack::truncate(last, LAST_MESSAGE_CHARS)
         );
     }
     if !files.is_empty() {
@@ -454,38 +454,140 @@ pub fn strip_private(text: &str) -> String {
     out
 }
 
-/// Replace credential-shaped tokens with `[redacted]`: PEM lines, `Bearer x`,
-/// AWS access keys, GitHub, Slack, `OpenAI` and Anthropic key prefixes, Google
-/// API keys. Deliberately a short list; the note is a summary, not a vault.
+/// What a session note may quote of a prompt or a response: `<private>`
+/// spans dropped, credentials redacted, surrounding whitespace trimmed.
+fn scrub(text: &str) -> String {
+    redact(&strip_private(text)).trim().to_owned()
+}
+
+const REDACTED: &str = "[redacted]";
+
+/// Replace credentials with `[redacted]`:
+///
+/// - PEM blocks, from the `-----BEGIN` line through the `-----END` line, or
+///   through the last line of key material when the block is cut short;
+/// - the value after `Bearer`;
+/// - AWS access keys, GitHub, Slack, `OpenAI` and Anthropic key prefixes and
+///   Google API keys, wherever they sit in a word (`KEY=sk-…`,
+///   `https://user:ghp_…@host`);
+/// - the value assigned to a name ending in `key`, `token`, `secret`,
+///   `password`, `passwd` or `pwd` (`DB_PASSWORD=…`, `"api_key": "…"`).
+///
+/// Deliberately a short list; the note is a summary, not a vault.
 #[must_use]
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let mut in_pem = false;
     for (i, line) in text.split('\n').enumerate() {
+        if in_pem {
+            if line.contains("-----END") {
+                in_pem = false;
+                continue;
+            }
+            if is_pem_body(line) {
+                continue;
+            }
+            // Not key material: the block was cut short or never was one.
+            in_pem = false;
+        }
         if i > 0 {
             out.push('\n');
         }
-        if line.contains("-----BEGIN") {
-            out.push_str("[redacted]");
+        if let Some(begin) = line.find("-----BEGIN") {
+            out.push_str(REDACTED);
+            in_pem = !line[begin..].contains("-----END");
             continue;
         }
-        let mut after_bearer = false;
-        for (j, word) in line.split(' ').enumerate() {
-            if j > 0 {
-                out.push(' ');
-            }
-            if after_bearer || is_secret_token(word) {
-                out.push_str("[redacted]");
-            } else {
-                out.push_str(word);
-            }
-            after_bearer = word.eq_ignore_ascii_case("bearer");
-        }
+        redact_line(line, &mut out);
     }
     out
 }
 
-fn is_secret_token(word: &str) -> bool {
-    let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+/// A line that can sit inside a PEM block: blank, base64, or one of the
+/// headers of an encrypted key.
+fn is_pem_body(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("Proc-Type:")
+        || line.starts_with("DEK-Info:")
+        || line
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// A character of a credential-shaped token or of an assigned name.
+const fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Where a redacted value stops: whitespace or a closing quote.
+fn value_end(s: &str) -> usize {
+    s.find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .unwrap_or(s.len())
+}
+
+fn redact_line(line: &str, out: &mut String) {
+    let mut rest = line;
+    while let Some(start) = rest.find(is_token_char) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(|c: char| !is_token_char(c)).unwrap_or(rest.len());
+        let (run, after) = rest.split_at(end);
+        rest = after;
+        if is_secret_token(run) {
+            out.push_str(REDACTED);
+            continue;
+        }
+        out.push_str(run);
+        let value_at = if run.eq_ignore_ascii_case("bearer") {
+            bearer_value_start(rest)
+        } else if is_secret_name(run) {
+            assigned_value_start(rest)
+        } else {
+            None
+        };
+        if let Some(at) = value_at {
+            let len = value_end(&rest[at..]);
+            if len > 0 {
+                out.push_str(&rest[..at]);
+                out.push_str(REDACTED);
+                rest = &rest[at + len..];
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+/// `Bearer <value>`: the offset of the value after the whitespace.
+fn bearer_value_start(rest: &str) -> Option<usize> {
+    let at = rest.find(|c: char| !c.is_whitespace())?;
+    (at > 0).then_some(at)
+}
+
+/// The offset of the value in what follows an assigned name: `=value`,
+/// `="value"`, or after a quoted name `": "value"`.
+fn assigned_value_start(rest: &str) -> Option<usize> {
+    let is_quote = |c: char| c == '"' || c == '\'';
+    let mut chars = rest.char_indices().peekable();
+    let quoted_name = chars.next_if(|&(_, c)| is_quote(c)).is_some();
+    if quoted_name {
+        while chars.next_if(|&(_, c)| c == ' ').is_some() {}
+    }
+    chars.next_if(|&(_, c)| c == '=' || (quoted_name && c == ':'))?;
+    if quoted_name {
+        while chars.next_if(|&(_, c)| c == ' ').is_some() {}
+    }
+    chars.next_if(|&(_, c)| is_quote(c));
+    Some(chars.peek().map_or(rest.len(), |&(i, _)| i))
+}
+
+fn is_secret_name(run: &str) -> bool {
+    let name = run.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "passwd", "pwd"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn is_secret_token(w: &str) -> bool {
     let aws = w.len() == 20
         && w.starts_with("AKIA")
         && w.bytes()
@@ -606,6 +708,118 @@ mod tests {
             r,
             "key [redacted] here\nAuthorization: Bearer [redacted]\n[redacted]\ntoken [redacted] end\nsk-short ok"
         );
+    }
+
+    #[test]
+    fn pem_blocks_are_redacted_whole() {
+        let pem = "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nc2VjcmV0\n-----END RSA PRIVATE KEY-----\nafter";
+        assert_eq!(redact(pem), "before\n[redacted]\nafter");
+        // Cut short (truncated paste): the key material still goes, the
+        // text after it stays.
+        assert_eq!(
+            redact("x\n-----BEGIN PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nc2VjcmV0+/=="),
+            "x\n[redacted]"
+        );
+        assert_eq!(
+            redact(
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\nMIIE\nand then some prose"
+            ),
+            "[redacted]\nand then some prose"
+        );
+        assert_eq!(
+            redact("-----BEGIN X----- abc -----END X-----\nkept"),
+            "[redacted]\nkept"
+        );
+    }
+
+    #[test]
+    fn secrets_inside_words_are_redacted() {
+        for (text, want) in [
+            (
+                "export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuv then test",
+                "export OPENAI_API_KEY=[redacted] then test",
+            ),
+            ("token:ghp_abcdefghijklmnop", "token:[redacted]"),
+            (
+                "git clone https://me:ghp_abcdefghijklmnop@github.com/x/y",
+                "git clone https://me:[redacted]@github.com/x/y",
+            ),
+            ("Bearer\teyJhbGciOi.J9.x-y_z", "Bearer\t[redacted]"),
+            (
+                r#"{"Authorization":"Bearer abc.def+/=","n":1}"#,
+                r#"{"Authorization":"Bearer [redacted]","n":1}"#,
+            ),
+            ("DB_PASSWORD=hunter2 ./run", "DB_PASSWORD=[redacted] ./run"),
+            (r#"password="hunter 2""#, r#"password="[redacted] 2""#),
+            (
+                r#"{"api_key": "abc123", "x": 1}"#,
+                r#"{"api_key": "[redacted]", "x": 1}"#,
+            ),
+            ("client_secret='s3cr3t'", "client_secret='[redacted]'"),
+        ] {
+            assert_eq!(redact(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_is_not_redacted() {
+        for text in [
+            "the primary key = id, and the token: a unit of text",
+            "max_tokens=1500 --budget=1500",
+            "a task-oriented-and-rather-long-hyphenated-word",
+            "the bearer.",
+            "let key = map.get(&token)?;",
+            "naïve café: key= (empty)",
+        ] {
+            assert_eq!(redact(text), text);
+        }
+    }
+
+    #[test]
+    fn title_and_prompt_are_scrubbed_before_truncation() {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+        let filler = "word ".repeat(PROMPT_CHARS / 5 - 4);
+        let t = Transcript {
+            first_prompt: Some(format!(
+                "export OPENAI_API_KEY={secret} and <private>my address</private> run\n{filler}{secret}"
+            )),
+            prompts: 1,
+            ..Transcript::default()
+        };
+        let now = jiff::Zoned::now();
+        let out = render(&Note {
+            session: "abcd1234",
+            project: None,
+            started: &now,
+            updated: &now,
+            transcript: &t,
+            last: None,
+            project_dir: Path::new("/p"),
+        });
+        assert!(
+            out.contains("\n# export OPENAI_API_KEY=[redacted] and run\n"),
+            "{out}"
+        );
+        assert!(!out.contains("sk-proj"), "{out}");
+        assert!(!out.contains("my address"), "{out}");
+
+        // A prompt that is nothing but a private span leaves no title or section.
+        let t = Transcript {
+            first_prompt: Some("<private>all of it</private>".to_owned()),
+            prompts: 1,
+            ..Transcript::default()
+        };
+        let out = render(&Note {
+            session: "abcd1234",
+            project: None,
+            started: &now,
+            updated: &now,
+            transcript: &t,
+            last: None,
+            project_dir: Path::new("/p"),
+        });
+        assert!(out.contains("\n# Session abcd1234\n"), "{out}");
+        assert!(!out.contains("## Prompt"), "{out}");
     }
 
     #[test]
