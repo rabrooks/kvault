@@ -161,7 +161,8 @@ kvault search ... --format cli|json|md|paths|ids --explain --per-chunk -n 20
 
 Four streams run independently and are fused by reciprocal rank fusion (k=60): all-terms
 FTS (weight 2), any-term FTS, exact title match, and tag match. Exclusions (`-word`, `-tag:x`,
-`NOT` inside `lex:`) apply to every stream. A small authority multiplier (0.85–1.15) from the
+`NOT` inside `lex:`) apply to every stream; a flag from a pasted command (`--release`, `-s`,
+`-1`) is searched for, not excluded. A small authority multiplier (0.85–1.15) from the
 root weight and `pinned: true` breaks ties, and files matching a root's `demote` globs take a
 further ×0.9 inside that band. A `MEMORY.md` index in a memory root never outranks a fact it
 points to on a line matching the query. Results are one chunk per document with the other
