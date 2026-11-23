@@ -606,6 +606,106 @@ fn rename_onto_a_soft_deleted_path_does_not_violate_uniqueness() {
     );
 }
 
+/// Active `(rel_path, title)` rows of the proj-b notes root, by path.
+fn proj_b_docs(store: &Store) -> Vec<(String, String)> {
+    store
+        .conn()
+        .prepare(
+            "SELECT d.rel_path, d.title FROM docs d JOIN roots r ON r.id = d.root_id
+             WHERE r.path LIKE '%proj-b%' AND d.active = 1 ORDER BY d.rel_path",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+const TEMPLATE: &str = "# Template\n\nBoilerplate every new note in this project starts from.\n";
+const OLD: &str = "# Old\n\nA document that is about to be renamed onto another path.\n";
+
+/// proj-b holds `other.md`, a soft-deleted `p.md` (the template) and, when
+/// `with_old`, a live `old.md`.
+fn with_soft_deleted_template(with_old: bool) -> Fixture {
+    let mut fx = fixture();
+    let notes = fx.base.join("proj-b/notes");
+    write(&notes.join("p.md"), TEMPLATE);
+    if with_old {
+        write(&notes.join("old.md"), OLD);
+    }
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    std::fs::remove_file(notes.join("p.md")).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.removed, 1);
+    fx
+}
+
+fn pairs(docs: &[(&str, &str)]) -> Vec<(String, String)> {
+    docs.iter()
+        .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
+        .collect()
+}
+
+/// A soft-deleted row deleted to make way for a rename must not be handed to
+/// a later new file with the same content: that used to fail the run, and
+/// every run after it, on a foreign key. `copy` sorts after or before the
+/// rename target, which used to fail differently (an error, or a file left
+/// with no row).
+#[test]
+fn rename_onto_a_soft_deleted_path_next_to_a_copy_of_its_content() {
+    for copy in ["z.md", "a.md"] {
+        let mut fx = with_soft_deleted_template(true);
+        let notes = fx.base.join("proj-b/notes");
+        std::fs::rename(notes.join("old.md"), notes.join("p.md")).unwrap();
+        write(&notes.join(copy), TEMPLATE);
+        age_all(&fx.base);
+        let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+        assert_eq!((r.renamed, r.added, r.removed), (1, 1, 0), "{copy}");
+        let mut want = pairs(&[
+            ("other.md", "Other project"),
+            ("p.md", "Old"),
+            (copy, "Template"),
+        ]);
+        want.sort();
+        assert_eq!(proj_b_docs(&fx.store), want, "{copy}");
+        // Every later run must still work, and find nothing to do.
+        let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+        assert_eq!(r.added + r.updated + r.renamed + r.removed, 0, "{copy}");
+        assert_eq!(
+            count(&fx.store, "SELECT COUNT(*) FROM docs WHERE active = 0"),
+            0
+        );
+    }
+}
+
+/// A soft-deleted row reused for a new file with its old content must not be
+/// reused again when its old path comes back with different content: one row
+/// used to end up holding the other file's text.
+#[test]
+fn restored_path_and_a_copy_of_its_old_content_get_their_own_rows() {
+    let mut fx = with_soft_deleted_template(false);
+    let notes = fx.base.join("proj-b/notes");
+    write(&notes.join("a.md"), TEMPLATE);
+    write(
+        &notes.join("p.md"),
+        "# Rewritten\n\nThe restored file says something else entirely now.\n",
+    );
+    age_all(&fx.base);
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!((r.added, r.renamed, r.removed), (2, 0, 0));
+    assert_eq!(
+        proj_b_docs(&fx.store),
+        pairs(&[
+            ("a.md", "Template"),
+            ("other.md", "Other project"),
+            ("p.md", "Rewritten")
+        ])
+    );
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(r.added + r.updated + r.renamed + r.removed, 0);
+}
+
 #[test]
 fn identical_content_files_are_all_soft_deleted() {
     let mut fx = fixture();

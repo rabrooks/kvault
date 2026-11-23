@@ -356,28 +356,22 @@ fn index_root(
                 .push((path.clone(), row.id));
         }
     }
-    let mut inactive_by_hash: HashMap<String, Vec<i64>> = HashMap::new();
-    for row in existing.values().filter(|r| !r.active) {
-        inactive_by_hash
-            .entry(row.blake3.clone())
-            .or_default()
-            .push(row.id);
-    }
+    let mut inactive = Inactive::new(&existing);
 
     for (file, hash, text) in pending_new {
+        // A soft-deleted row already at this path: reused if nothing better
+        // claims the file, deleted if a renamed row moves in.
+        let at_path = inactive.take_at(&file.rel_path);
         if let Some((_, id)) = vanished.get_mut(&hash).and_then(Vec::pop) {
-            move_doc_to_path(tx, id, &file.rel_path, &existing)?;
+            move_doc_to_path(tx, id, &file.rel_path, at_path)?;
             replace_doc(tx, id, &file, &hash, &text, report)?;
             report.renamed += 1;
-        } else if let Some(row) = existing.get(&file.rel_path) {
-            if let Some(ids) = inactive_by_hash.get_mut(&row.blake3) {
-                ids.retain(|&id| id != row.id);
-            }
-            tx.execute("UPDATE docs SET active = 1 WHERE id = ?1", params![row.id])?;
-            replace_doc(tx, row.id, &file, &hash, &text, report)?;
+        } else if let Some(id) = at_path {
+            tx.execute("UPDATE docs SET active = 1 WHERE id = ?1", params![id])?;
+            replace_doc(tx, id, &file, &hash, &text, report)?;
             report.added += 1;
-        } else if let Some(id) = inactive_by_hash.get_mut(&hash).and_then(Vec::pop) {
-            move_doc_to_path(tx, id, &file.rel_path, &existing)?;
+        } else if let Some(id) = inactive.take_with_hash(&hash) {
+            move_doc_to_path(tx, id, &file.rel_path, None)?;
             replace_doc(tx, id, &file, &hash, &text, report)?;
             report.added += 1;
         } else {
@@ -411,21 +405,77 @@ fn soft_delete(tx: &Transaction<'_>, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Point doc `id` at `rel_path`, first removing any soft-deleted row that
-/// already holds that path so `UNIQUE(root_id, rel_path)` is satisfied.
+/// The soft-deleted rows of a root that a new file may still claim, by path
+/// and by content hash. A row is taken out of both views at once, so a row
+/// reused or deleted for one file is never offered to a later one.
+struct Inactive {
+    by_path: HashMap<String, i64>,
+    by_hash: HashMap<String, Vec<i64>>,
+    rows: HashMap<i64, (String, String)>,
+}
+
+impl Inactive {
+    fn new(existing: &HashMap<String, DocRow>) -> Self {
+        let mut me = Self {
+            by_path: HashMap::new(),
+            by_hash: HashMap::new(),
+            rows: HashMap::new(),
+        };
+        for (path, row) in existing.iter().filter(|(_, r)| !r.active) {
+            me.by_path.insert(path.clone(), row.id);
+            me.by_hash
+                .entry(row.blake3.clone())
+                .or_default()
+                .push(row.id);
+            me.rows.insert(row.id, (path.clone(), row.blake3.clone()));
+        }
+        // Newest row last, so `take_with_hash` is deterministic.
+        for ids in me.by_hash.values_mut() {
+            ids.sort_unstable();
+        }
+        me
+    }
+
+    /// Take the soft-deleted row at `rel_path`, if any.
+    fn take_at(&mut self, rel_path: &str) -> Option<i64> {
+        let id = *self.by_path.get(rel_path)?;
+        self.forget(id);
+        Some(id)
+    }
+
+    /// Take a soft-deleted row whose content had this hash, if any.
+    fn take_with_hash(&mut self, hash: &str) -> Option<i64> {
+        let id = *self.by_hash.get(hash)?.last()?;
+        self.forget(id);
+        Some(id)
+    }
+
+    fn forget(&mut self, id: i64) {
+        if let Some((path, hash)) = self.rows.remove(&id) {
+            self.by_path.remove(&path);
+            if let Some(ids) = self.by_hash.get_mut(&hash) {
+                ids.retain(|&other| other != id);
+            }
+        }
+    }
+}
+
+/// Point doc `id` at `rel_path`, first deleting the soft-deleted row `stale`
+/// that holds that path, if there is one, so `UNIQUE(root_id, rel_path)` is
+/// satisfied.
 fn move_doc_to_path(
     tx: &Transaction<'_>,
     id: i64,
     rel_path: &str,
-    existing: &HashMap<String, DocRow>,
+    stale: Option<i64>,
 ) -> Result<()> {
-    if let Some(stale) = existing.get(rel_path).filter(|r| !r.active && r.id != id) {
-        clear_doc_children(tx, stale.id)?;
+    if let Some(stale) = stale.filter(|&stale| stale != id) {
+        clear_doc_children(tx, stale)?;
         tx.execute(
             "UPDATE links SET to_doc_id = NULL WHERE to_doc_id = ?1",
-            params![stale.id],
+            params![stale],
         )?;
-        tx.execute("DELETE FROM docs WHERE id = ?1", params![stale.id])?;
+        tx.execute("DELETE FROM docs WHERE id = ?1", params![stale])?;
     }
     tx.execute(
         "UPDATE docs SET rel_path = ?1, active = 1 WHERE id = ?2",
