@@ -236,12 +236,16 @@ The hooks:
 Hooks read Claude Code's JSON on stdin, print JSON on stdout and always exit 0. A failure
 prints `{}` and appends one line to `~/.local/state/kvault/hooks.log` (`KVAULT_LOG`
 overrides), so a week of use can be audited with one `cat`. Stop and `PreCompact` make no
-LLM calls and read at most 1 MB of the transcript (the first 128 KB and the last 896 KB).
+LLM calls and read about 1 MB of the transcript: the first 128 KB and the last 896 KB. (The
+start is read further, up to 4 MB, only when the first prompt alone is larger than that, as
+with a pasted image.) In a session longer than that, files touched in the unread middle stay
+listed from the note's earlier versions.
 
 The session note is `<project>/notes/sessions/<date>-<session8>.md`, one file per session
 rewritten on every stop, where `<project>` is the nearest ancestor of `cwd` with a `.git`.
-When the project has no `notes/` dir it goes to `[capture] fallback_dir` (default
-`~/.local/share/kvault/sessions/<project>/`). Each project directory there is indexed
+When the project has no `notes/` dir, or has one that no configured root covers (kvault
+does not write into directories it does not index), it goes to `[capture] fallback_dir`
+(default `~/.local/share/kvault/sessions/<project>/`). Each project directory there is indexed
 without being configured, as an `other` root named for the project. The note carries
 `kind: session`, the first prompt (its first line is the title, so the brief's recent
 list reads as a log), the last assistant message, and the files the

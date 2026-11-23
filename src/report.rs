@@ -36,6 +36,10 @@ pub struct Summary {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Sessions {
+    /// Sessions seen at all in the period, by a brief, a turn, a query or a
+    /// use. The base of the shares: a session that began before the period
+    /// and searched inside it has no brief or first turn in it.
+    pub seen: usize,
     /// Sessions that were given a brief at start.
     pub briefed: usize,
     /// Sessions that completed at least one turn.
@@ -107,6 +111,14 @@ pub fn in_period(events: Vec<Event>, since: Option<&str>) -> Vec<Event> {
             e.at().parse::<jiff::Timestamp>().is_ok_and(|t| t >= cutoff) || e.at().is_empty()
         })
         .collect()
+}
+
+/// How many different ids the sets hold between them.
+fn distinct(sets: &[&HashSet<&str>]) -> usize {
+    sets.iter()
+        .flat_map(|s| s.iter())
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Summarise events. `hook_errors` is counted by the caller, from the hook
@@ -201,6 +213,7 @@ pub fn summarize(events: &[Event], hook_errors: usize) -> Summary {
         .count();
     s.versions = versions.into_iter().collect();
     s.sessions = Sessions {
+        seen: distinct(&[&briefed, &completed, &searched, &used, &followed]),
         briefed: briefed.len(),
         completed: completed.len(),
         searched: searched.len(),
@@ -297,7 +310,7 @@ impl Summary {
             "sessions  {} given a brief, {} completed a turn",
             se.briefed, se.completed
         );
-        let base = se.completed.max(se.briefed);
+        let base = se.seen;
         let _ = writeln!(
             out,
             "          {} searched ({}), {} used a result ({}), {} used a note from the brief ({})",
@@ -403,12 +416,32 @@ mod tests {
             .collect()
     }
 
+    /// A session that began before the period and searched inside it has no
+    /// brief or first turn in it, and still counts in the base of the shares.
+    #[test]
+    fn shares_never_exceed_the_sessions_seen() {
+        let mut all = events();
+        all.extend(
+            [
+                r#"{"event":"query","at":"2026-11-20T12:00:00Z","command":"recall","query":"q","session":"old1","total":1,"hits":[]}"#,
+                r#"{"event":"query","at":"2026-11-20T12:01:00Z","command":"recall","query":"q","session":"old2","total":1,"hits":[]}"#,
+            ]
+            .iter()
+            .map(|l| serde_json::from_str::<Event>(l).unwrap()),
+        );
+        let s = summarize(&all, 2);
+        assert_eq!((s.sessions.seen, s.sessions.searched), (4, 3));
+        let text = s.render();
+        assert!(text.contains("3 searched (75%)"), "{text}");
+    }
+
     #[test]
     fn summary_counts_sessions_queries_and_uses() {
         let s = summarize(&events(), 2);
         assert_eq!(
             s.sessions,
             Sessions {
+                seen: 2,
                 briefed: 2,
                 completed: 2,
                 searched: 1,

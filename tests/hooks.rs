@@ -446,3 +446,80 @@ fn capture_can_be_disabled() {
     );
     assert!(!cwd.join("notes/sessions").exists());
 }
+
+/// A `notes/` directory no configured root covers belongs to someone else
+/// (a third-party checkout): the session note goes to the fallback, where it
+/// is indexed, and nothing is written into their repository.
+#[test]
+fn stop_does_not_write_into_a_notes_dir_that_is_not_indexed() {
+    let fallback_holder = tempfile::tempdir().unwrap();
+    let fallback = fallback_holder.path().join("sessions");
+    let e = env(Some(&fallback.to_string_lossy()));
+    // Two levels down, so the fixture's `*/notes` root does not reach it.
+    let cwd = e.fx.base.join("vendor/upstream");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    write(&cwd.join("notes/RELEASE.md"), "# Their release notes\n");
+    let t = e.fx.base.join("transcript.jsonl");
+    transcript(&t, &cwd);
+    e.hook(
+        "stop",
+        &serde_json::json!({"session_id":"abcd1111","cwd":cwd,"transcript_path":t,"last_assistant_message":"ok"}).to_string(),
+    );
+    assert_eq!(e.log(), "");
+    assert!(!cwd.join("notes/sessions").exists());
+    let names: Vec<_> = std::fs::read_dir(fallback.join("upstream"))
+        .unwrap()
+        .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with("-abcd1111.md"));
+}
+
+/// The session note and the use tracking are independent: when the note
+/// cannot be written, the turn is still recorded.
+#[test]
+fn a_failed_capture_does_not_skip_use_tracking() {
+    let e = env(None);
+    let cwd = e.fx.base.join("proj-a");
+    // A file where the sessions directory should be.
+    std::fs::write(cwd.join("notes/sessions"), "in the way").unwrap();
+    let t = e.fx.base.join("transcript.jsonl");
+    transcript(&t, &cwd);
+    let v = e.hook(
+        "stop",
+        &serde_json::json!({"session_id":"abcd2222","cwd":cwd,"transcript_path":t,"last_assistant_message":"ok"}).to_string(),
+    );
+    assert_eq!(v, serde_json::json!({}));
+    let log = e.log();
+    assert!(log.contains(" stop capture: "), "{log}");
+    let sessions: Vec<_> = query_log(&e)
+        .into_iter()
+        .filter(|l| l["event"] == "session" && l["session"] == "abcd2222")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{:?}", query_log(&e));
+}
+
+/// Another process holding the index's write lock must not cost the session
+/// its brief: the hook has five seconds in all.
+#[test]
+fn session_start_gives_a_stale_brief_when_the_index_is_locked() {
+    let e = env(None);
+    let cwd = e.fx.base.join("proj-a");
+    e.fx.store.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    let began = std::time::Instant::now();
+    let v = e.hook(
+        "session-start",
+        &serde_json::json!({"session_id":"abcd3333","cwd":cwd,"source":"startup"}).to_string(),
+    );
+    let took = began.elapsed();
+    e.fx.store.conn().execute_batch("ROLLBACK").unwrap();
+    let text = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no brief: {v}"));
+    assert!(text.starts_with("# kvault: proj-a"), "{text}");
+    assert!(e.log().contains(" session-start index: "), "{}", e.log());
+    assert!(
+        took < std::time::Duration::from_millis(3500),
+        "waited {took:?} for the lock"
+    );
+}

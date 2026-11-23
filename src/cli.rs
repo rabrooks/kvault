@@ -222,8 +222,10 @@ pub struct SearchArgs {
     /// Return every matching chunk instead of the best chunk per document
     #[arg(long)]
     pub per_chunk: bool,
-    /// Disable the link-neighbour stream
-    #[arg(long)]
+    /// Reserved for the link-neighbour stream, which does not exist yet:
+    /// accepted so existing callers keep working, hidden because it does
+    /// nothing.
+    #[arg(long, hide = true)]
     pub no_graph: bool,
 }
 
