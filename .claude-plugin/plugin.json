@@ -1,6 +1,6 @@
 {
   "name": "kvault",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared memory for coding agents. kvault indexes the markdown notes you already keep and gives Claude Code a session-start brief and token-budgeted search across every project. One Rust binary, no daemon, no LLM.",
   "author": { "name": "Aaron Brooks" },
   "repository": "https://github.com/rabrooks/kvault",
