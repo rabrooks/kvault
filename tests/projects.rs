@@ -15,7 +15,7 @@ use kvault::brief::{self, BriefOptions};
 use kvault::config::{Config, ProjectConfig, ProjectFrom, RootConfig};
 use kvault::index::{self, IndexOptions};
 use kvault::list::{self, ListFilter};
-use kvault::roots::RootKind;
+use kvault::roots::{self, RootKind};
 use kvault::search::{self, Query, SearchOptions};
 use kvault::store::Store;
 use predicates::prelude::*;
@@ -276,4 +276,54 @@ fn cli_explain_shows_demotion_and_config_round_trips() {
         .stdout(predicate::str::starts_with(
             "# kvault: mas (4 notes, 1 memory facts",
         ));
+}
+
+/// A Claude memory root's project comes from the slug of the directory it
+/// belongs to, which is not always a directory name: `_` and `.` become `-`,
+/// and outside `~/Projects` the slug keeps the whole path tail. The cwd finds
+/// such a project through the slug of its own path.
+#[test]
+fn cwd_resolves_to_its_memory_root_by_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let underscored = base.join("Projects/field_ops");
+    let nested = base.join("dotfiles/nvim");
+    let unrelated = base.join("Projects/field-ops-two");
+    for dir in [&underscored, &nested, &unrelated] {
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+    }
+    for dir in [&underscored, &nested] {
+        write(
+            &base
+                .join("mem")
+                .join(roots::path_slug(dir))
+                .join("memory/fact.md"),
+            "---\nname: fact\ndescription: a fact\n---\n\nA fact worth keeping around.\n",
+        );
+    }
+    let config = Config {
+        roots: vec![RootConfig::new(
+            format!("{}/mem/*/memory", base.display()),
+            RootKind::Memory,
+            ProjectFrom::ClaudeSlug,
+        )],
+        capture: common::isolated_capture(&base),
+        ..Config::default()
+    };
+    let mut store = Store::open(&base.join("index.db")).unwrap();
+    index::run(&config, &mut store, &IndexOptions::default()).unwrap();
+
+    let project = |dir: &std::path::Path| brief::project_for(&store, dir).unwrap();
+    let field_ops = project(&underscored).unwrap();
+    assert!(field_ops.ends_with("field-ops"), "{field_ops}");
+    let nvim = project(&nested).unwrap();
+    assert!(nvim.ends_with("dotfiles-nvim"), "{nvim}");
+    assert_ne!(field_ops, nvim);
+
+    // Subdirectories belong to the nearest ancestor with a memory root.
+    assert_eq!(project(&underscored.join("src/deep")), Some(field_ops));
+    assert_eq!(project(&nested.join("src")), Some(nvim));
+    // A sibling with a similar name and no memory of its own has no project.
+    assert_eq!(project(&unrelated), None);
+    assert_eq!(project(&base.join("dotfiles")), None);
 }
