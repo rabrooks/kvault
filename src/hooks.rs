@@ -9,6 +9,7 @@
 
 use std::io::{Read, Write as _};
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,14 +52,31 @@ impl HookEvent {
     }
 }
 
+/// How long `SessionStart` waits for another process's write lock on the
+/// index before skipping its own index run. The hook has five seconds in
+/// all, and the index's usual busy timeout is the same five: left alone, a
+/// busy index would use up the hook's whole time and the session would get
+/// no brief at all, where a slightly stale one was there for the reading.
+const SESSION_START_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Run a hook end to end, stdin to the string to print. Never fails: an
-/// error is logged and `{}` returned.
+/// error, or a panic, is logged and `{}` returned.
 #[must_use]
 pub fn run(event: HookEvent) -> String {
-    match read_input().and_then(|input| handle(event, &input)) {
-        Ok(v) => v.to_string(),
-        Err(e) => {
+    let outcome = std::panic::catch_unwind(|| read_input().and_then(|input| handle(event, &input)));
+    match outcome {
+        Ok(Ok(v)) => v.to_string(),
+        Ok(Err(e)) => {
             log(event, &format!("{e:#}"));
+            "{}".to_owned()
+        }
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            log(event, &format!("panic: {what}"));
             "{}".to_owned()
         }
     }
@@ -94,7 +112,8 @@ pub fn handle(event: HookEvent, input: &HookInput) -> Result<Value> {
     match event {
         HookEvent::SessionStart => session_start(&config, &mut store, input, &cwd),
         HookEvent::Stop | HookEvent::PreCompact => {
-            capture_session(&config, &mut store, input, &cwd)
+            capture_session(event, &config, &mut store, input, &cwd);
+            Ok(json!({}))
         }
     }
 }
@@ -110,6 +129,7 @@ fn session_start(
     if matches!(input.source.as_deref(), Some("resume" | "fork")) {
         return Ok(json!({}));
     }
+    store.conn().busy_timeout(SESSION_START_BUSY_TIMEOUT)?;
     if !config.effective_roots().is_empty()
         && let Err(e) = index::run(
             config,
@@ -173,35 +193,52 @@ pub fn session_start_output(text: &str) -> Value {
     })
 }
 
+/// Write the session note and record which listed notes were used. The two
+/// are independent: a note that cannot be written (read-only directory, full
+/// disk, busy index) must not cost the turn its use tracking, so each
+/// failure is logged and the other half still runs.
 fn capture_session(
+    event: HookEvent,
     config: &Config,
     store: &mut Store,
     input: &HookInput,
     cwd: &Path,
-) -> Result<Value> {
-    if config.capture.enabled {
-        let written = capture::run(
-            config,
-            store,
-            &CaptureInput {
-                session_id: &input.session_id,
-                cwd,
-                transcript_path: input.transcript_path.as_deref(),
-                last_assistant_message: input.last_assistant_message.as_deref(),
-            },
-        )?;
-        if let Some(path) = written {
-            index::reindex_root_containing(config, store, &path)?;
-        }
+) {
+    if config.capture.enabled
+        && let Err(e) = write_session_note(config, store, input, cwd)
+    {
+        log(event, &format!("capture: {e:#}"));
     }
     if config.query_log.enabled
         && let Some(log_path) = Config::query_log_path()
         && let Some(transcript) = input.transcript_path.as_deref().filter(|p| p.is_file())
+        && let Err(e) = capture::scan_transcript(transcript)
+            .and_then(|scan| querylog::mark_used(&log_path, &input.session_id, Some(cwd), &scan))
     {
-        let scan = capture::scan_transcript(transcript)?;
-        querylog::mark_used(&log_path, &input.session_id, Some(cwd), &scan)?;
+        log(event, &format!("query log: {e:#}"));
     }
-    Ok(json!({}))
+}
+
+fn write_session_note(
+    config: &Config,
+    store: &mut Store,
+    input: &HookInput,
+    cwd: &Path,
+) -> Result<()> {
+    let written = capture::run(
+        config,
+        store,
+        &CaptureInput {
+            session_id: &input.session_id,
+            cwd,
+            transcript_path: input.transcript_path.as_deref(),
+            last_assistant_message: input.last_assistant_message.as_deref(),
+        },
+    )?;
+    if let Some(path) = written {
+        index::reindex_root_containing(config, store, &path)?;
+    }
+    Ok(())
 }
 
 /// Append one line to the hook log. Logging failures are ignored: a hook

@@ -289,6 +289,39 @@ pub fn read(path: &Path) -> Result<Vec<Event>> {
         .collect())
 }
 
+/// The parseable lines of the log that mention `session`. The log holds
+/// every session there has been and this runs on every turn of every one,
+/// so lines are skipped on a substring check without being parsed; a false
+/// positive (the id inside a path or a query) is parsed and then ignored by
+/// the caller's own match on the session.
+///
+/// # Errors
+/// Returns an error if the file exists but cannot be read.
+pub fn read_session(path: &Path, session: &str) -> Result<Vec<Event>> {
+    use std::io::BufRead as _;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut events = Vec::new();
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.windows(session.len()).any(|w| w == session.as_bytes()) {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_slice(&line) {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
 /// Record that this session completed a turn, once, and which notes its
 /// queries and briefs listed that the transcript shows were then used.
 /// Returns how many lines were added; none are repeated when the hook runs
@@ -305,7 +338,7 @@ pub fn mark_used(
     if session.is_empty() {
         return Ok(0);
     }
-    let events = read(path)?;
+    let events = read_session(path, session)?;
     let known: HashSet<(&str, &str, How)> = events
         .iter()
         .filter_map(|e| match e {
@@ -453,6 +486,36 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn read_session_keeps_only_lines_naming_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queries.jsonl");
+        append(
+            &path,
+            &[
+                query("2026-11-20T10:00:00Z", "sess-one"),
+                query("2026-11-20T10:01:00Z", "sess-two"),
+                query("2026-11-20T10:02:00Z", "sess-one"),
+            ],
+        )
+        .unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("not json but mentions sess-one\n");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(read(&path).unwrap().len(), 3);
+        let mine = read_session(&path, "sess-one").unwrap();
+        assert_eq!(mine.len(), 2);
+        assert!(
+            mine.iter()
+                .all(|e| matches!(e, Event::Query(q) if q.session.as_deref() == Some("sess-one")))
+        );
+        assert!(
+            read_session(&tmp.path().join("missing"), "x")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn action(at: &str, kind: ActionKind, text: &str) -> Action {

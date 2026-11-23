@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,11 @@ pub const TRANSCRIPT_HEAD: u64 = 128 * 1024;
 /// Bytes read from the end: last message and files touched. Head plus tail
 /// is the 1 MB ceiling the hook contract promises.
 pub const TRANSCRIPT_TAIL: u64 = 896 * 1024;
+/// How far the head read goes on when the first prompt has not been seen
+/// within [`TRANSCRIPT_HEAD`]: one record holding a pasted image can be
+/// larger than the whole head, and the note's title and file name both hang
+/// on that first prompt.
+pub const TRANSCRIPT_HEAD_MAX: u64 = 4 * 1024 * 1024;
 /// Characters kept of the last assistant message.
 pub const LAST_MESSAGE_CHARS: usize = 4_000;
 /// Characters kept of the first prompt.
@@ -58,6 +63,9 @@ pub struct Transcript {
     pub files: BTreeMap<String, Touch>,
     /// File tool calls, shell commands and assistant text, in order.
     pub actions: Vec<Action>,
+    /// The middle of the transcript was not read: `files` and `actions`
+    /// cover the end of the session only.
+    pub partial: bool,
 }
 
 /// One thing the assistant did, kept so the query log can tell which search
@@ -123,6 +131,13 @@ pub fn run(config: &Config, store: &Store, input: &CaptureInput<'_>) -> Result<O
         .map_or_else(|| now.clone(), |t| t.to_zoned(now.time_zone().clone()));
     let dir = session_dir(config, &project_dir, project.as_deref());
     let path = dir.join(format!("{}-{session}.md", started.date()));
+    // A long session is scanned at its two ends only, so files touched in
+    // the middle drop out of later scans: keep what the note already lists.
+    let carried = if transcript.partial {
+        files_in_note(&path)
+    } else {
+        Vec::new()
+    };
     let note = render(&Note {
         session: &session,
         project: project.as_deref(),
@@ -131,10 +146,29 @@ pub fn run(config: &Config, store: &Store, input: &CaptureInput<'_>) -> Result<O
         transcript: &transcript,
         last: last.as_deref(),
         project_dir: &project_dir,
+        carried: &carried,
     });
     std::fs::create_dir_all(&dir)?;
     write_atomic(&path, &note)?;
     Ok(Some(path))
+}
+
+/// The `files_touched` of the session note at `path`, if there is one.
+fn files_in_note(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let (fm, _) = crate::markdown::split_frontmatter(&text);
+    fm.extra
+        .get("files_touched")
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// First eight characters of the session id, keeping only filename-safe ones.
@@ -158,16 +192,28 @@ pub fn project_dir(cwd: &Path) -> PathBuf {
 }
 
 /// `<project>/<session_dir>` when the first component of `session_dir`
-/// (normally `notes`) exists under the project, else the fallback dir with
-/// a per-project subdirectory.
+/// (normally `notes`) exists under the project and is indexed, else the
+/// fallback dir with a per-project subdirectory. A `notes/` directory that
+/// no configured root covers is somebody else's (a third-party checkout
+/// with its own `notes/`): a session note written there would be an
+/// untracked file in their repository that kvault never indexes.
 fn session_dir(config: &Config, project_dir: &Path, project: Option<&str>) -> PathBuf {
     let rel = Path::new(&config.capture.session_dir);
     let anchor = rel.components().next().map(|c| project_dir.join(c));
-    if anchor.is_some_and(|p| p.is_dir()) {
+    if anchor.is_some_and(|p| p.is_dir() && under_a_root(config, &p)) {
         project_dir.join(rel)
     } else {
         expand_tilde(&config.capture.fallback_dir).join(project.unwrap_or(GLOBAL_SESSIONS_DIR))
     }
+}
+
+/// Whether an existing directory is a configured root or inside one.
+fn under_a_root(config: &Config, dir: &Path) -> bool {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = canonical(dir);
+    crate::roots::expand_config(config)
+        .iter()
+        .any(|root| dir.starts_with(canonical(&root.path)))
 }
 
 struct Note<'a> {
@@ -178,6 +224,9 @@ struct Note<'a> {
     transcript: &'a Transcript,
     last: Option<&'a str>,
     project_dir: &'a Path,
+    /// Files an earlier version of this note listed, relative to
+    /// `project_dir`, kept when the scan no longer reaches them.
+    carried: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -220,12 +269,17 @@ fn render(n: &Note<'_>) -> String {
                 )
             },
         );
-    let files: Vec<(String, Touch)> = n
+    let mut files: Vec<(String, Touch)> = n
         .transcript
         .files
         .iter()
         .map(|(p, t)| (relative_to(p, n.project_dir), *t))
         .collect();
+    for old in n.carried {
+        if !files.iter().any(|(p, _)| p == old) {
+            files.push((old.clone(), Touch::default()));
+        }
+    }
     let fm = Frontmatter {
         title: title.clone(),
         kind: "session",
@@ -263,6 +317,9 @@ fn render(n: &Note<'_>) -> String {
             if t.reads > 0 {
                 what.push(format!("read ×{}", t.reads));
             }
+            if what.is_empty() {
+                what.push("earlier in the session".to_owned());
+            }
             let _ = writeln!(out, "- {p} ({})", what.join(", "));
         }
     }
@@ -275,43 +332,61 @@ fn relative_to(path: &str, dir: &Path) -> String {
         .map_or_else(|_| path.to_owned(), |p| p.to_string_lossy().into_owned())
 }
 
-/// Scan a Claude Code transcript (`JSON` lines). Reads at most the head and
-/// tail ceilings; the gap, if any, only costs an exact prompt count.
+/// Scan a Claude Code transcript (`JSON` lines). Reads the head and the
+/// tail, up to their ceilings; the gap, if any, costs an exact prompt count
+/// and the files touched in the middle (see [`Transcript::partial`]).
+///
+/// The head is read in whole lines, and past its ceiling until the first
+/// prompt has been seen (within [`TRANSCRIPT_HEAD_MAX`]): the start time and
+/// the first prompt name the note, so they must not depend on where the
+/// tail happens to begin.
 ///
 /// # Errors
 /// Returns an error if the file cannot be read.
 pub fn scan_transcript(path: &Path) -> Result<Transcript> {
-    let (head, tail) = read_head_tail(path)?;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let whole = len <= TRANSCRIPT_HEAD + TRANSCRIPT_TAIL;
+    let mut reader = BufReader::new(file);
     let mut t = Transcript::default();
-    for line in head.lines() {
-        scan_line(line, &mut t);
+    let mut pos = 0;
+    let mut line = Vec::new();
+    while pos < len {
+        let head_done =
+            pos >= TRANSCRIPT_HEAD && (t.first_prompt.is_some() || pos >= TRANSCRIPT_HEAD_MAX);
+        if !whole && head_done {
+            break;
+        }
+        let limit = if whole {
+            u64::MAX
+        } else {
+            TRANSCRIPT_HEAD_MAX.saturating_sub(pos).max(1)
+        };
+        line.clear();
+        let read = (&mut reader).take(limit).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        pos += read as u64;
+        // A record cut by the limit never parses.
+        scan_line(&String::from_utf8_lossy(&line), &mut t);
     }
-    if let Some(tail) = tail {
-        // The first tail line is almost certainly cut; a partial record never parses.
-        for line in tail.lines().skip(1) {
+    if pos < len {
+        let start = pos.max(len.saturating_sub(TRANSCRIPT_TAIL));
+        t.partial = start > pos;
+        reader.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail)?;
+        // After a jump the first line is almost certainly cut; a partial
+        // record never parses.
+        for line in String::from_utf8_lossy(&tail)
+            .lines()
+            .skip(usize::from(t.partial))
+        {
             scan_line(line, &mut t);
         }
     }
     Ok(t)
-}
-
-fn read_head_tail(path: &Path) -> Result<(String, Option<String>)> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
-    if len <= TRANSCRIPT_HEAD + TRANSCRIPT_TAIL {
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        return Ok((String::from_utf8_lossy(&buf).into_owned(), None));
-    }
-    let mut head = vec![0; usize::try_from(TRANSCRIPT_HEAD).unwrap_or(usize::MAX)];
-    f.read_exact(&mut head)?;
-    f.seek(SeekFrom::Start(len - TRANSCRIPT_TAIL))?;
-    let mut tail = Vec::new();
-    f.read_to_end(&mut tail)?;
-    Ok((
-        String::from_utf8_lossy(&head).into_owned(),
-        Some(String::from_utf8_lossy(&tail).into_owned()),
-    ))
 }
 
 /// The parts of a transcript record kvault reads.
@@ -795,6 +870,7 @@ mod tests {
             transcript: &t,
             last: None,
             project_dir: Path::new("/p"),
+            carried: &[],
         });
         assert!(
             out.contains("\n# export OPENAI_API_KEY=[redacted] and run\n"),
@@ -817,9 +893,141 @@ mod tests {
             transcript: &t,
             last: None,
             project_dir: Path::new("/p"),
+            carried: &[],
         });
         assert!(out.contains("\n# Session abcd1234\n"), "{out}");
         assert!(!out.contains("## Prompt"), "{out}");
+    }
+
+    fn record(kind: &str, at: &str, content: &Value) -> String {
+        serde_json::json!({"type": kind, "isSidechain": false, "timestamp": at,
+            "message": {"role": kind, "content": content}})
+        .to_string()
+    }
+
+    fn read_call(path: &str) -> Value {
+        serde_json::json!([{"type": "tool_use", "id": "t", "name": "Read",
+            "input": {"file_path": path}}])
+    }
+
+    /// A first prompt larger than the head (a pasted image) used to leave
+    /// the head with nothing, so the note's start time and title came from
+    /// wherever the tail began, and moved as the transcript grew.
+    #[test]
+    fn a_first_prompt_larger_than_the_head_still_names_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let image = "A".repeat(usize::try_from(TRANSCRIPT_HEAD).unwrap() * 2);
+        let mut text = record(
+            "user",
+            "2026-10-28T16:45:30.000Z",
+            &Value::String(format!("Describe this screenshot {image}")),
+        );
+        text.push('\n');
+        text.push_str(&record(
+            "assistant",
+            "2026-10-28T16:46:00.000Z",
+            &read_call("/p/early.rs"),
+        ));
+        text.push('\n');
+        let filler = record(
+            "assistant",
+            "2026-10-28T17:00:00.000Z",
+            &serde_json::json!([{"type": "text", "text": "x".repeat(4000)}]),
+        );
+        let mut scans = Vec::new();
+        for rounds in [300, 600] {
+            for _ in 0..rounds {
+                text.push_str(&filler);
+                text.push('\n');
+            }
+            text.push_str(&record(
+                "assistant",
+                "2026-10-29T09:00:00.000Z",
+                &read_call("/p/late.rs"),
+            ));
+            text.push('\n');
+            std::fs::write(&path, &text).unwrap();
+            scans.push(scan_transcript(&path).unwrap());
+        }
+        for t in &scans {
+            assert!(t.partial);
+            assert_eq!(t.started.as_deref(), Some("2026-10-28T16:45:30.000Z"));
+            assert!(
+                t.first_prompt
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("Describe this screenshot")),
+            );
+            assert!(t.files.contains_key("/p/late.rs"));
+        }
+        assert!(
+            !scans[1].files.contains_key("/p/early.rs"),
+            "the middle of a long transcript is not read"
+        );
+    }
+
+    #[test]
+    fn a_short_transcript_is_read_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let text = [
+            record(
+                "user",
+                "2026-10-28T16:45:30.000Z",
+                &Value::String("Fix it".into()),
+            ),
+            record(
+                "assistant",
+                "2026-10-28T16:46:00.000Z",
+                &read_call("/p/a.rs"),
+            ),
+        ]
+        .join("\n");
+        std::fs::write(&path, text).unwrap();
+        let t = scan_transcript(&path).unwrap();
+        assert!(!t.partial);
+        assert_eq!(t.first_prompt.as_deref(), Some("Fix it"));
+        assert!(t.files.contains_key("/p/a.rs"));
+    }
+
+    /// Files an earlier version of the note listed stay listed when a long
+    /// transcript's scan no longer reaches them.
+    #[test]
+    fn files_from_the_earlier_note_are_carried() {
+        let mut t = Transcript {
+            first_prompt: Some("Fix it".to_owned()),
+            prompts: 1,
+            partial: true,
+            ..Transcript::default()
+        };
+        t.files
+            .insert("/p/src/late.rs".to_owned(), Touch { edits: 1, reads: 0 });
+        let now = jiff::Zoned::now();
+        let carried = ["src/early.rs".to_owned(), "src/late.rs".to_owned()];
+        let out = render(&Note {
+            session: "abcd1234",
+            project: None,
+            started: &now,
+            updated: &now,
+            transcript: &t,
+            last: None,
+            project_dir: Path::new("/p"),
+            carried: &carried,
+        });
+        assert!(
+            out.contains("files_touched:\n- src/late.rs\n- src/early.rs\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("- src/late.rs (edited ×1)\n- src/early.rs (earlier in the session)\n"),
+            "{out}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.md");
+        std::fs::write(&path, &out).unwrap();
+        assert_eq!(files_in_note(&path), ["src/late.rs", "src/early.rs"]);
+        assert!(files_in_note(&tmp.path().join("missing.md")).is_empty());
     }
 
     #[test]
@@ -847,6 +1055,7 @@ mod tests {
             transcript: &t,
             last: Some("All <private>secret</private> done"),
             project_dir: Path::new("/p"),
+            carried: &[],
         });
         assert!(
             out.starts_with(
