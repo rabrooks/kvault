@@ -1,13 +1,16 @@
 # kvault
 
-Local-first knowledge index for coding agents. Markdown files on disk are the only source of
-truth; kvault derives a disposable SQLite index (FTS5 over heading-level chunks, links, tags)
-and gives agents token-budgeted retrieval through a CLI, Claude Code hooks, and an optional
-MCP adapter.
+Shared memory for coding agents. kvault indexes the markdown notes you already keep and gives
+Claude Code a session-start brief and token-budgeted search across every project. One Rust
+binary, no daemon, no LLM.
+
+Markdown files on disk are the only source of truth. kvault derives a disposable SQLite index
+(FTS5 over heading-level chunks, links, tags) and serves it through a CLI and Claude Code
+hooks; an MCP adapter is planned.
 
 ## Status
 
-**0.2.0-beta.2, in trial use.** Indexing, search, budgeted recall, the session brief, the
+**0.2.0, beta, in trial use.** Indexing, search, budgeted recall, the session brief, the
 Claude Code hooks and skill, session capture, `add`, the query log and `report` all work.
 Two commands are declared but not built, and exit with code 3 saying so: `links` (link
 neighbours of a note) and `serve` (an MCP stdio adapter, behind `--features mcp`). Links
