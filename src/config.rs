@@ -254,6 +254,27 @@ impl Config {
     /// Describes the first problem found.
     pub fn validate(&self) -> anyhow::Result<()> {
         for root in &self.roots {
+            // A relative path would name a different directory in every
+            // working directory, under one root row.
+            let path = expand_tilde(&root.path);
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "root {}: the path must be absolute or start with ~/",
+                    root.path
+                );
+            }
+            // A pattern that cannot be parsed matches nothing, and a root
+            // that matches nothing reads as a root that has gone away.
+            if let Err(e) = glob::Pattern::new(&path.to_string_lossy()) {
+                anyhow::bail!("root {}: bad glob pattern: {e}", root.path);
+            }
+            if !(root.weight.is_finite() && root.weight > 0.0) {
+                anyhow::bail!(
+                    "root {}: weight must be a positive number, got {}",
+                    root.path,
+                    root.weight
+                );
+            }
             if !(root.demote_factor > 0.0 && root.demote_factor <= 1.0) {
                 anyhow::bail!(
                     "root {}: demote_factor must be in (0, 1], got {}",
@@ -529,6 +550,39 @@ budget = 1500
                 .unwrap();
         assert!(c.roots[0].demote.is_empty());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn root_paths_weights_and_globs_are_validated() {
+        let err = |toml_text: &str| {
+            toml::from_str::<Config>(toml_text)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string()
+        };
+        for path in ["notes", "./notes", "~", "~other/notes"] {
+            let e = err(&format!("[[roots]]\npath = \"{path}\"\n"));
+            assert!(
+                e.contains("must be absolute or start with ~/"),
+                "{path}: {e}"
+            );
+        }
+        let e = err("[[roots]]\npath = \"/x/[abc/notes\"\n");
+        assert!(e.contains("bad glob pattern"), "{e}");
+        for weight in ["0.0", "-1.0", "nan", "inf"] {
+            let e = err(&format!("[[roots]]\npath = \"/x\"\nweight = {weight}\n"));
+            assert!(
+                e.contains("weight must be a positive number"),
+                "{weight}: {e}"
+            );
+        }
+        for ok in ["/x", "~/notes", "/x/*/notes", "~/Projects/*/notes"] {
+            toml::from_str::<Config>(&format!("[[roots]]\npath = \"{ok}\"\nweight = 1.2\n"))
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
     }
 
     #[test]

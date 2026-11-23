@@ -124,6 +124,21 @@ pub fn parse(text: &str, fallback_title: &str) -> Parsed {
     let mut chunks = build_chunks(text, body_start, &headings, &line_index, &counter);
     chunks = split_oversize(text, chunks, &line_index, &counter);
     chunks = merge_tiny(chunks);
+    // A file that is all frontmatter (a memory fact with only a
+    // `description`) has no body to chunk, and a document with no chunk has
+    // no row in the search index: give it one empty chunk to carry its
+    // title and description.
+    if chunks.is_empty() && (frontmatter.title.is_some() || frontmatter.description.is_some()) {
+        chunks.push(make_chunk(
+            text,
+            body_start,
+            text.len(),
+            String::new(),
+            0,
+            &line_index,
+            &counter,
+        ));
+    }
     for (i, c) in chunks.iter_mut().enumerate() {
         c.ordinal = u32::try_from(i).unwrap_or(u32::MAX);
     }
@@ -444,6 +459,42 @@ fn split_oversize(
     out
 }
 
+/// Whether the lines seen so far leave a fenced code block open. A fence
+/// opened by N backticks (or tildes) closes only at a line of at least N of
+/// the same character and nothing else, so a block fenced with four
+/// backticks can show a line of three, and a backtick block a line of
+/// tildes, without ending.
+#[derive(Default)]
+struct Fence(Option<(char, usize)>);
+
+impl Fence {
+    const fn inside(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Feed one trimmed line. Returns whether it was a fence delimiter.
+    fn line(&mut self, trimmed: &str) -> bool {
+        let Some(mark) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            return false;
+        };
+        let run = trimmed.chars().take_while(|&c| c == mark).count();
+        if run < 3 {
+            return false;
+        }
+        match self.0 {
+            None => {
+                self.0 = Some((mark, run));
+                true
+            }
+            Some((open, len)) if open == mark && run >= len && trimmed.len() == run => {
+                self.0 = None;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+}
+
 /// Offset (relative to `s`) of the best line start to cut at, or `None` if
 /// no legal cut exists.
 fn best_cut(s: &str, counter: &impl TokenCounter) -> Option<usize> {
@@ -453,15 +504,22 @@ fn best_cut(s: &str, counter: &impl TokenCounter) -> Option<usize> {
     let lo = target * 6 / 10;
     let hi = (target * 12 / 10).min(s.len());
 
-    let mut in_fence = false;
+    let mut fence = Fence::default();
     let mut best: Option<(usize, u32, usize)> = None; // (offset, score, distance)
     let mut fallback_after: Option<usize> = None;
     let mut offset = 0;
     let mut prev_blank = true;
     for line in s.split_inclusive('\n') {
+        // Past the window nothing can beat a cut found in it, and the first
+        // legal line after it is the fallback: stop instead of scanning the
+        // rest of the section, which made splitting a long one quadratic.
+        if offset > hi && (best.is_some() || fallback_after.is_some()) {
+            break;
+        }
         let trimmed = line.trim();
-        let fence_line = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-        if offset > 0 && !in_fence {
+        let was_inside = fence.inside();
+        fence.line(trimmed);
+        if offset > 0 && !was_inside {
             let score: u32 = if is_hr(trimmed) {
                 60
             } else if prev_blank {
@@ -486,9 +544,6 @@ fn best_cut(s: &str, counter: &impl TokenCounter) -> Option<usize> {
             } else if offset > hi && fallback_after.is_none() {
                 fallback_after = Some(offset);
             }
-        }
-        if fence_line {
-            in_fence = !in_fence;
         }
         prev_blank = trimmed.is_empty();
         offset += line.len();
@@ -552,7 +607,7 @@ fn collect_links(body: &str, body_start: usize, lines: &LineIndex) -> Vec<Link> 
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let dest = dest_url.as_ref();
                 if is_relative_md(dest) {
-                    let target = dest.split('#').next().unwrap_or(dest).to_owned();
+                    let target = percent_decode(dest.split('#').next().unwrap_or(dest));
                     out.push(Link {
                         target,
                         link_type: LinkType::Markdown,
@@ -639,18 +694,40 @@ fn relation_verb(line: &str, col: usize) -> Option<String> {
     }
 }
 
+/// Decode `%XX` escapes (`my%20note.md` → `my note.md`), the way a link to
+/// a file with a space in its name is written. Anything that is not a valid
+/// escape, or does not decode to UTF-8, is kept as written.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(&a), Some(&b)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(hi), Some(lo)) = (hex(a), hex(b))
+        {
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'?'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
 // ---------------------------------------------------------------- observations
 
 fn collect_observations(body: &str, body_start: usize, lines: &LineIndex) -> Vec<Observation> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    let mut fence = Fence::default();
     let mut offset = 0;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        } else if !in_fence
-            && !trimmed.starts_with('>')
+        if fence.line(trimmed) || fence.inside() {
+            // A delimiter, or code.
+        } else if !trimmed.starts_with('>')
             && let Some(obs) = parse_observation(trimmed, lines.line_of(body_start + offset))
         {
             out.push(obs);
@@ -706,6 +783,78 @@ fn parse_observation(trimmed: &str, line: u32) -> Option<Observation> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_kind_and_length() {
+        let inside_after = |lines: &[&str]| {
+            let mut f = Fence::default();
+            for l in lines {
+                f.line(l);
+            }
+            f.inside()
+        };
+        assert!(!inside_after(&["```rust", "let x = 1;", "```"]));
+        // A longer fence shows a shorter one; a backtick fence shows tildes.
+        assert!(inside_after(&["````md", "```", "code", "```"]));
+        assert!(!inside_after(&["````md", "```", "code", "```", "````"]));
+        assert!(inside_after(&["```", "~~~", "still code"]));
+        // An info string cannot close a fence.
+        assert!(inside_after(&["```", "```rust"]));
+        assert!(!inside_after(&["``inline``", "~~struck~~"]));
+    }
+
+    #[test]
+    fn observations_are_not_read_out_of_nested_fences() {
+        let text = "# T\n\n- [decision] real one\n\n````md\n```\n- [decision] in code\n```\n- [decision] also code\n````\n\n- [fact] after the block\n";
+        let got: Vec<String> = parse(text, "t")
+            .observations
+            .into_iter()
+            .map(|o| o.text)
+            .collect();
+        assert_eq!(got, ["real one", "after the block"]);
+    }
+
+    #[test]
+    fn link_targets_are_percent_decoded() {
+        assert_eq!(percent_decode("my%20note.md"), "my note.md");
+        assert_eq!(percent_decode("caf%C3%A9.md"), "café.md");
+        assert_eq!(percent_decode("100%.md"), "100%.md");
+        assert_eq!(percent_decode("bad%zz%2"), "bad%zz%2");
+        assert_eq!(percent_decode("%ff.md"), "%ff.md", "not UTF-8: kept");
+        let links = parse("See [it](sub/my%20note.md#part).\n", "t").links;
+        assert_eq!(links[0].target, "sub/my note.md");
+    }
+
+    #[test]
+    fn a_file_that_is_all_frontmatter_still_gets_a_chunk() {
+        let text = "---\nname: wal\ndescription: always open the index in WAL mode\n---\n";
+        let p = parse(text, "wal");
+        assert_eq!(p.chunks.len(), 1);
+        assert_eq!(p.chunks[0].byte_start, text.len());
+        assert_eq!(p.chunks[0].byte_end, text.len());
+        // Nothing to say and nothing to call it: still no chunk.
+        assert!(parse("", "empty").chunks.is_empty());
+        assert!(parse("---\ntags: [x]\n---\n", "t").chunks.is_empty());
+    }
+
+    /// The cut is the same as a scan of the whole section would choose; the
+    /// scan just stops once nothing later can change it.
+    #[test]
+    fn a_long_section_is_split_into_bounded_chunks() {
+        let para = "word ".repeat(60);
+        let text = format!("# Long\n\n{}", format!("{para}\n\n").repeat(400));
+        let p = parse(&text, "long");
+        assert!(p.chunks.len() > 10, "{}", p.chunks.len());
+        assert!(p.chunks.iter().all(|c| c.tokens <= MAX_CHUNK_TOKENS));
+        assert_eq!(p.chunks[0].byte_start, 0);
+        assert_eq!(p.chunks.last().unwrap().byte_end, text.len());
+        assert!(
+            p.chunks
+                .windows(2)
+                .all(|w| w[0].byte_end == w[1].byte_start),
+            "chunks tile the section"
+        );
+    }
 
     #[test]
     fn frontmatter_absent() {

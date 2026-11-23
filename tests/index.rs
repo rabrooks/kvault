@@ -877,3 +877,157 @@ fn non_utf8_file_is_indexed_lossily_not_fatal() {
         1
     );
 }
+
+/// Only Windows separates paths with a backslash. Elsewhere it is part of a
+/// name, and folding it made two files claim one path, failing every run.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_file_name_is_not_a_separator() {
+    let mut fx = fixture();
+    let notes = fx.base.join("proj-b/notes");
+    std::fs::create_dir_all(notes.join("a")).unwrap();
+    write(
+        &notes.join("a/b.md"),
+        "# Slash\n\nThe file in a directory.\n",
+    );
+    write(
+        &notes.join("a\\b.md"),
+        "# Backslash\n\nThe file with an odd name.\n",
+    );
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let docs = proj_b_docs(&fx.store);
+    assert!(
+        docs.contains(&("a/b.md".to_owned(), "Slash".to_owned())),
+        "{docs:?}"
+    );
+    assert!(
+        docs.contains(&("a\\b.md".to_owned(), "Backslash".to_owned())),
+        "{docs:?}"
+    );
+}
+
+/// A file indexed from lossily decoded bytes must be readable the same way.
+#[test]
+fn a_non_utf8_file_can_be_read_back() {
+    let mut fx = fixture();
+    let bad = fx.base.join("proj-b/notes/latin1.md");
+    std::fs::write(
+        &bad,
+        b"# Caf\xe9\n\nbody with a stray byte \xff here and more words after\n",
+    )
+    .unwrap();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let text = kvault::get::run(
+        &fx.store,
+        &kvault::get::Target::parse("proj-b/notes/latin1.md"),
+        true,
+    )
+    .unwrap();
+    assert!(text.contains("more words after"), "{text}");
+    let packed = kvault::recall::run(
+        &fx.store,
+        &kvault::search::Query::parse("stray byte"),
+        &kvault::recall::RecallOptions {
+            budget: 1500,
+            project: None,
+            format: kvault::cli::RecallFormat::Md,
+        },
+    )
+    .unwrap();
+    assert!(packed.text.contains("more words after"), "{}", packed.text);
+}
+
+/// A root is on the current parser only when every file in it was re-parsed.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_keeps_its_root_marked_for_reparse() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fx = fixture();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    fx.store
+        .conn()
+        .execute("UPDATE roots SET parser_version = '0'", [])
+        .unwrap();
+    let locked = fx.base.join("proj-b/notes/other.md");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(r.unwrap().errors >= 1);
+    let stale = |store: &Store| {
+        count(
+            store,
+            &format!(
+                "SELECT COUNT(*) FROM roots WHERE path LIKE '%proj-%' AND parser_version IS NOT '{}'",
+                index::PARSER_VERSION
+            ),
+        )
+    };
+    assert_eq!(stale(&fx.store), 1, "only the root with the unread file");
+    let r = index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!((r.errors, r.updated), (0, 1));
+    assert_eq!(stale(&fx.store), 0);
+}
+
+/// A memory fact that is nothing but frontmatter is found by its description.
+#[test]
+fn a_frontmatter_only_fact_is_searchable() {
+    let mut fx = fixture();
+    write(
+        &fx.base
+            .join("mem/-Users-x-Projects-proj-a/memory/quorum.md"),
+        "---\nname: quorum\ndescription: the zookeeper ensemble needs a quorum of three\n---\n",
+    );
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let hits = kvault::search::run(
+        &fx.store,
+        &kvault::search::Query::parse("zookeeper quorum"),
+        &kvault::search::SearchOptions::default(),
+    )
+    .unwrap()
+    .hits;
+    assert_eq!(hits[0].chunk.doc.rel_path, "quorum.md");
+    let text = kvault::get::run(
+        &fx.store,
+        &kvault::get::Target::Id(hits[0].chunk.id.clone()),
+        true,
+    )
+    .unwrap();
+    assert!(text.contains("zookeeper ensemble"), "{text}");
+}
+
+/// An unchanged corpus is not rewritten link by link on every run, and a
+/// link ambiguous across roots resolves the same way whatever order the
+/// documents were indexed in.
+#[test]
+fn links_are_only_written_when_their_target_changes() {
+    let mut fx = fixture();
+    age_all(&fx.base);
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let resolved = |store: &Store| -> Vec<(String, Option<i64>)> {
+        store
+            .conn()
+            .prepare("SELECT target, to_doc_id FROM links ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let before = resolved(&fx.store);
+    assert!(before.iter().any(|(_, to)| to.is_some()));
+    fx.store
+        .conn()
+        .execute_batch(
+            "CREATE TEMP TABLE link_writes(n INTEGER);
+             CREATE TEMP TRIGGER count_link_writes AFTER UPDATE ON main.links
+             BEGIN INSERT INTO link_writes VALUES (1); END;",
+        )
+        .unwrap();
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    assert_eq!(count(&fx.store, "SELECT COUNT(*) FROM link_writes"), 0);
+    assert_eq!(resolved(&fx.store), before);
+}
