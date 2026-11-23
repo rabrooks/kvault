@@ -34,11 +34,10 @@ ranking is explainable; the core stays small.
 
 ## Quick start
 
-Requires Rust 1.95 (pinned in `rust-toolchain.toml`; `rustup` picks it up).
+Requires Rust 1.95 or newer (`rustup update stable`).
 
 ```bash
-git clone https://github.com/rabrooks/kvault && cd kvault
-cargo install --path .        # puts `kvault` on PATH (~/.cargo/bin)
+cargo install kvault          # puts `kvault` on PATH (~/.cargo/bin)
 kvault init                   # writes the config, then indexes
 kvault status                 # roots found, document counts
 kvault recall "something you know is in your notes"
@@ -68,13 +67,15 @@ carries the hook definitions and the skill, and its hooks call `kvault` from `PA
 /plugin install kvault@kvault
 ```
 
-or, for a single session without installing, `claude --plugin-dir <path to this clone>`.
+or, for a single session without installing, `claude --plugin-dir <path to a clone of this repo>`.
 
 Nothing is uploaded anywhere. kvault never
 moves or rewrites your notes: the only files it writes are session notes, notes you `add`,
 and the pointer line `add` appends to `MEMORY.md` in a Claude Code memory dir.
 
-To work on kvault itself: `cargo build --release` and `cargo test`.
+To work on kvault itself, clone the repository (`rust-toolchain.toml` pins Rust 1.95, which
+`rustup` picks up), then `cargo build --release` and `cargo test`. `cargo install --path .`
+installs a build of the clone in place of the released one.
 
 ## Configuration
 
