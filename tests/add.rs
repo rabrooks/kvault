@@ -102,7 +102,9 @@ fn add_refuses_to_overwrite_without_the_current_hash() {
         .write_stdin("second")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("exists; pass --expected-hash"));
+        .stderr(predicate::str::contains(
+            "already holds this note; read it, then pass --expected-hash",
+        ));
     e.kvault()
         .args([
             "add",
@@ -214,4 +216,111 @@ fn add_rejects_an_empty_body() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("nothing to add"));
+}
+
+/// Two titles can make the same file name. The second is refused, and the
+/// refusal must not hand over the hash that would replace the first.
+#[test]
+fn add_refuses_a_different_note_with_the_same_file_name() {
+    let e = env();
+    let out = e
+        .kvault()
+        .args(["add", "--title", "C notes", "--project", "proj-b"])
+        .write_stdin("about c")
+        .assert()
+        .success();
+    let hash = hash_line(&out.get_output().stdout);
+    let path = e.fx.base.join("proj-b/notes/c-notes.md");
+
+    e.kvault()
+        .args(["add", "--title", "C++ notes", "--project", "proj-b"])
+        .write_stdin("about c++")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is taken by a different note (\"C notes\"); choose another title",
+        ))
+        .stderr(predicate::str::contains("expected-hash").not())
+        .stderr(predicate::str::contains(&hash[..12]).not());
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("about c\n")
+    );
+
+    // A hand-written file with no frontmatter title is someone else's too.
+    let plain = e.fx.base.join("proj-b/notes/plain.md");
+    std::fs::write(&plain, "# Plain\n\nwritten by hand\n").unwrap();
+    e.kvault()
+        .args(["add", "--title", "Plain", "--project", "proj-b"])
+        .write_stdin("generated")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is taken by a different note (untitled)",
+        ));
+    assert!(
+        std::fs::read_to_string(&plain)
+            .unwrap()
+            .contains("written by hand")
+    );
+}
+
+#[test]
+fn expected_hash_must_be_long_enough_and_have_something_to_replace() {
+    let e = env();
+    let add = |hash: &str| {
+        let mut cmd = e.kvault();
+        cmd.args([
+            "add",
+            "--title",
+            "Fresh",
+            "--project",
+            "proj-b",
+            "--expected-hash",
+            hash,
+        ])
+        .write_stdin("body");
+        cmd
+    };
+    add("abc")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs at least 8 hex digits"));
+    add("0123456789abcdef")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nothing to replace"));
+    assert!(!e.fx.base.join("proj-b/notes/fresh.md").exists());
+}
+
+/// `MEMORY.md` is Claude Code's own index: whatever is in it stays, even when
+/// it is not valid UTF-8 or lacks a final newline.
+#[test]
+fn memory_md_is_appended_to_never_rewritten() {
+    let e = env();
+    let mem = e.fx.base.join("mem/-Users-x-Projects-proj-a/memory");
+    let before: &[u8] = b"- [old](old.md) \xff broken byte\n- [other](other.md) no newline";
+    std::fs::write(mem.join("MEMORY.md"), before).unwrap();
+    let add = |title: &str| {
+        e.kvault()
+            .args(["add", "--title", title, "--root", &mem.to_string_lossy()])
+            .write_stdin("Always open the index in WAL mode.")
+            .assert()
+            .success();
+    };
+    add("Prefer WAL");
+    let mut want = before.to_vec();
+    want.extend_from_slice(
+        "\n- [Prefer WAL](prefer-wal.md) — Always open the index in WAL mode.\n".as_bytes(),
+    );
+    assert_eq!(std::fs::read(mem.join("MEMORY.md")).unwrap(), want);
+
+    // A title's line break cannot split the pointer line.
+    add("Two\nlines");
+    let text = String::from_utf8_lossy(&std::fs::read(mem.join("MEMORY.md")).unwrap()).into_owned();
+    assert!(
+        text.ends_with("\n- [Two lines](two-lines.md) — Always open the index in WAL mode.\n"),
+        "{text}"
+    );
 }

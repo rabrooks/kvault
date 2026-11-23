@@ -51,9 +51,11 @@ printf '%s\n' "<body>" | kvault add --title "<topic>" --kind decision
 ```
 
 Writes `<slug>.md` into the project's notes root (the memory root when that is the
-only one) and indexes it. One note per topic: to update, `kvault get` it, then pass
-`--expected-hash <blake3 printed by the earlier add>`; a mismatch means someone
-else wrote first, so read again. Save decisions with the why; facts and how-tos as
+only one) and indexes it. One note per topic: to update, `kvault get` it, then run
+`add` with the same title and `--expected-hash <blake3>`. `add` prints the blake3
+when it writes, and again when it refuses to replace a note of the same title; a
+mismatch means someone else wrote first, so read again. If `add` says the file name
+is taken by a different note, pick a more specific title. Save decisions with the why; facts and how-tos as
 one line of claim then detail. Session notes (`kind: session`) are written
 automatically on every stop; promote anything durable out of them with `add`, do
 not edit them.

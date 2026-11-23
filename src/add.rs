@@ -76,26 +76,55 @@ pub fn run(config: &Config, store: &mut Store, opts: &AddOptions, body: &str) ->
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
+    let expected = opts.expected_hash.as_deref().map(str::to_ascii_lowercase);
+    if expected.as_ref().is_some_and(|h| h.len() < HASH_PREFIX_MIN) {
+        return Err(other(format!(
+            "--expected-hash needs at least {HASH_PREFIX_MIN} hex digits"
+        )));
+    }
     let mut created = None;
-    if let Some(bytes) = &existing {
-        let current = blake3::hash(bytes).to_hex().to_string();
-        match opts.expected_hash.as_deref().map(str::to_ascii_lowercase) {
-            Some(h) if h.len() >= HASH_PREFIX_MIN && current.starts_with(&h) => {}
-            Some(_) => {
-                return Err(other(format!(
-                    "{} changed since it was read (blake3 is now {current}); re-read it and retry",
-                    path.display()
-                )));
-            }
-            None => {
-                return Err(other(format!(
-                    "{} exists; pass --expected-hash {current} to replace it",
-                    path.display()
-                )));
-            }
+    match (&existing, &expected) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(other(format!(
+                "{} does not exist, so there is nothing to replace; drop --expected-hash to create it",
+                path.display()
+            )));
         }
-        let (fm, _) = markdown::split_frontmatter(&String::from_utf8_lossy(bytes));
-        created = fm.created;
+        (Some(bytes), expected) => {
+            let current = blake3::hash(bytes).to_hex().to_string();
+            let (fm, _) = markdown::split_frontmatter(&String::from_utf8_lossy(bytes));
+            match expected {
+                Some(h) if current.starts_with(h.as_str()) => {}
+                Some(_) => {
+                    return Err(other(format!(
+                        "{} changed since it was read (blake3 is now {current}); re-read it and retry",
+                        path.display()
+                    )));
+                }
+                // The same note: say how to replace it. The hash is the
+                // caller's proof of having looked, so it is only offered here.
+                None if fm.title.as_deref().map(one_line) == Some(one_line(&opts.title)) => {
+                    return Err(other(format!(
+                        "{} already holds this note; read it, then pass --expected-hash {current} to replace it",
+                        path.display()
+                    )));
+                }
+                // A different note whose title makes the same file name
+                // (`C++ notes` and `C notes`): never offer to replace that.
+                None => {
+                    return Err(other(format!(
+                        "{} is taken by a different note ({}); choose another title",
+                        path.display(),
+                        fm.title.as_deref().map_or_else(
+                            || "untitled".to_owned(),
+                            |t| format!("\"{}\"", one_line(t))
+                        )
+                    )));
+                }
+            }
+            created = fm.created;
+        }
     }
 
     let today = jiff::Zoned::now().date().to_string();
@@ -112,12 +141,7 @@ pub fn run(config: &Config, store: &mut Store, opts: &AddOptions, body: &str) ->
     };
 
     std::fs::create_dir_all(&dir)?;
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, &text)?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        Error::Io(e)
-    })?;
+    place(&path, &text, existing.as_deref())?;
     if is_memory {
         add_memory_pointer(&dir, &slug, &opts.title, &description(body))?;
     }
@@ -128,6 +152,59 @@ pub fn run(config: &Config, store: &mut Store, opts: &AddOptions, body: &str) ->
         replaced: existing.is_some(),
         indexed,
     })
+}
+
+/// Collapse whitespace runs, newlines included, to single spaces.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Put `text` at `path` without losing anyone else's write: a new file is
+/// created only if the path is still free, and an existing one is replaced
+/// only if it still holds the bytes (`existing`) the caller's hash vouched
+/// for. The temporary file is named per process, so two writers never share
+/// one.
+fn place(path: &Path, text: &str, existing: Option<&[u8]>) -> Result<()> {
+    let tmp = path.with_extension(format!("md.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    let placed = match existing {
+        None => create_new(&tmp, path, text),
+        Some(before) => match std::fs::read(path) {
+            Ok(now) if now == before => std::fs::rename(&tmp, path).map_err(Error::Io),
+            Ok(_) | Err(_) => Err(other(format!(
+                "{} changed while this note was being written; re-read it and retry",
+                path.display()
+            ))),
+        },
+    };
+    let _ = std::fs::remove_file(&tmp);
+    placed
+}
+
+/// Create `path` from the finished `tmp`, failing if `path` exists. A hard
+/// link is atomic and exclusive; where the filesystem has none, fall back to
+/// an exclusive create.
+fn create_new(tmp: &Path, path: &Path, text: &str) -> Result<()> {
+    use std::io::{ErrorKind, Write as _};
+    let taken = || {
+        other(format!(
+            "{} was created while this note was being written; read it and retry",
+            path.display()
+        ))
+    };
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken()),
+        Err(_) => match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut f) => Ok(f.write_all(text.as_bytes())?),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(taken()),
+            Err(e) => Err(e.into()),
+        },
+    }
 }
 
 fn other(msg: impl Into<String>) -> Error {
@@ -291,18 +368,34 @@ fn description(body: &str) -> String {
 }
 
 /// Append `- [title](slug.md) — description` to the root's `MEMORY.md` unless
-/// a line already points at that file.
+/// a line already points at that file. The file is Claude Code's own index
+/// and may be edited under us, so it is only ever appended to, never
+/// rewritten, and a file that cannot be read is left alone.
 fn add_memory_pointer(dir: &Path, slug: &str, title: &str, description: &str) -> Result<()> {
+    use std::io::Write as _;
     let index = dir.join("MEMORY.md");
-    let mut text = std::fs::read_to_string(&index).unwrap_or_default();
-    if text.contains(&format!("]({slug}.md)")) {
+    let current = match std::fs::read(&index) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let target = format!("]({slug}.md)");
+    if current
+        .windows(target.len())
+        .any(|w| w == target.as_bytes())
+    {
         return Ok(());
     }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
+    let mut line = String::new();
+    if !current.is_empty() && !current.ends_with(b"\n") {
+        line.push('\n');
     }
-    let _ = writeln!(text, "- [{title}]({slug}.md) — {description}");
-    std::fs::write(index, text)?;
+    let _ = writeln!(line, "- [{}]({slug}.md) — {description}", one_line(title));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(index)?
+        .write_all(line.as_bytes())?;
     Ok(())
 }
 
@@ -310,6 +403,41 @@ fn add_memory_pointer(dir: &Path, slug: &str, title: &str, description: &str) ->
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn place_never_takes_a_path_someone_else_got_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.md");
+
+        // The path was free when `add` looked, and is not any more.
+        std::fs::write(&path, "theirs").unwrap();
+        let err = place(&path, "ours", None).unwrap_err().to_string();
+        assert!(err.contains("was created while"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+
+        // The file changed after its hash was checked.
+        let err = place(&path, "ours", Some(b"what we read"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed while"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+
+        place(&path, "ours", Some(b"theirs")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        std::fs::remove_file(&path).unwrap();
+        place(&path, "new", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(leftovers(tmp.path()), ["note.md"], "no temporary files");
+    }
 
     fn opts(title: &str, kind: Option<&str>, tags: &[&str]) -> AddOptions {
         AddOptions {

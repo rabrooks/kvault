@@ -257,9 +257,12 @@ kvault add --title T [--kind decision|fact|howto|note] [--tags a,b] [--project P
 
 writes `<slug>.md` with frontmatter into the project's notes root (the memory root when
 that is the only one; `--root` to choose) and indexes it. The body comes from `--file` or
-stdin. An existing file is replaced only when `--expected-hash` matches the BLAKE3 the
-previous `add` printed (a prefix of eight or more hex digits is enough), so two agents
-cannot overwrite each other unknowingly. In a Claude Code memory root the file uses that
+stdin. An existing file is replaced only when `--expected-hash` matches the BLAKE3 of its
+current bytes (a prefix of eight or more hex digits is enough). `add` prints that hash
+when it writes, and when it refuses to replace a note of the same title; a file whose
+title differs (two titles can make the same file name) is never offered for replacement.
+A new file is created only if its path is still free, so two agents cannot overwrite each
+other unknowingly. In a Claude Code memory root the file uses that
 loader's `name`/`description`/`metadata.type` frontmatter and a pointer line is appended to
 `MEMORY.md`.
 
