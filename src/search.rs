@@ -71,8 +71,10 @@ const INDEX_CAP_RATIO: f64 = 0.99;
 const PREFIX_MIN_LEN: usize = 3;
 /// Sibling chunk ids listed per document hit.
 const MAX_SIBLINGS: usize = 5;
-/// Hex digits of the chunk hash printed as its id. Eight digits keep the
-/// chance of two chunks sharing an id negligible for corpora of 100k chunks.
+/// Hex digits of the chunk hash printed as its id. Eight digits are 32
+/// bits: two chunks share an id with about 1% probability at 10k chunks and
+/// more likely than not past 80k, so `get` reports an ambiguous id instead
+/// of guessing (see [`crate::get::chunk_by_id`]).
 const SHORT_ID_LEN: usize = 8;
 
 /// Common English words dropped from bare queries. Kept when quoted, when
@@ -122,6 +124,23 @@ impl Unit {
                 prefix: false,
             } => format!("\"{word}\""),
             Self::Phrase(words) => format!("\"{}\"", words.join(" ")),
+        }
+    }
+
+    /// Whether the unit occurs in `runs`, the lowercase alphanumeric runs of
+    /// some text: a term as a whole run (or the start of one when `prefix`),
+    /// a phrase as consecutive runs. The same test `FTS5` applies.
+    fn in_runs(&self, runs: &[String]) -> bool {
+        match self {
+            Self::Term { word, prefix } => runs
+                .iter()
+                .any(|r| r == word || (*prefix && r.starts_with(word.as_str()))),
+            Self::Phrase(words) => {
+                !words.is_empty()
+                    && runs
+                        .windows(words.len())
+                        .any(|w| w.iter().zip(words).all(|(a, b)| a == b))
+            }
         }
     }
 
@@ -699,11 +718,13 @@ pub fn run(store: &Store, query: &Query, opts: &SearchOptions) -> Result<SearchR
     let strict = query.fts_strict();
     let fts_weight = if strict.is_some() { 1.0 } else { 2.0 };
     if let Some(expr) = strict {
-        streams.push(timed("strict", 2.0, || fts_stream(store, &expr, &filter))?);
+        streams.push(timed("strict", 2.0, || {
+            fts_stream(store, &expr, &filter, false)
+        })?);
     }
     if let Some(expr) = query.fts_loose() {
         streams.push(timed("fts", fts_weight, || {
-            fts_stream(store, &expr, &filter)
+            fts_stream(store, &expr, &filter, query.lexical.is_some())
         })?);
     }
     // Document-level streams attach to the document's best FTS chunk so the
@@ -716,11 +737,20 @@ pub fn run(store: &Store, query: &Query, opts: &SearchOptions) -> Result<SearchR
                 m.entry(c.doc_id).or_insert(c.chunk_id);
                 m
             });
+    // A `lex:` expression is evaluated by FTS alone. Its units are only an
+    // approximation of it (`a AND b`, `NOT (a OR b)`), so there the document
+    // streams may boost a document FTS matched but never add one.
+    let boost_only = |mut ranked: Vec<Candidate>| {
+        if query.lexical.is_some() {
+            ranked.retain(|c| best_chunk.contains_key(&c.doc_id));
+        }
+        ranked
+    };
     streams.push(timed("title", 1.0, || {
-        title_stream(store, query, &filter, &best_chunk, &excluded)
+        title_stream(store, query, &filter, &best_chunk, &excluded).map(boost_only)
     })?);
     streams.push(timed("tags", 1.0, || {
-        tags_stream(store, query, &filter, &best_chunk, &excluded)
+        tags_stream(store, query, &filter, &best_chunk, &excluded).map(boost_only)
     })?);
 
     let mut fused = fuse(&streams);
@@ -781,13 +811,21 @@ fn timed(
 
 /// Map an `FTS5` failure to a readable error; `FTS5` reports bad syntax when
 /// the statement is stepped, so this wraps the row collection too.
-fn fts_error(e: rusqlite::Error) -> Error {
+/// Map a failed `MATCH` to "bad query syntax". `FTS5` words its complaints
+/// several ways (`fts5: syntax error`, `unterminated string`, `no such
+/// column: x`), so for a user-written `lex:` expression every failure with a
+/// message is one; for the expressions built here, only those naming `fts5`.
+fn match_error(e: rusqlite::Error, user_expression: bool) -> Error {
     match e {
-        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("fts5") => {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) if user_expression || msg.contains("fts5") => {
             Error::Other(anyhow::anyhow!("bad query syntax: {msg}"))
         }
         other => Error::Sqlite(other),
     }
+}
+
+fn fts_error(e: rusqlite::Error) -> Error {
+    match_error(e, false)
 }
 
 /// Chunks matching a negative unit; the FTS streams exclude them through the
@@ -806,7 +844,12 @@ fn excluded_chunks(store: &Store, query: &Query) -> Result<HashSet<i64>> {
         .map_err(fts_error)
 }
 
-fn fts_stream(store: &Store, expr: &str, filter: &Filter) -> Result<Vec<Candidate>> {
+fn fts_stream(
+    store: &Store,
+    expr: &str,
+    filter: &Filter,
+    user_expression: bool,
+) -> Result<Vec<Candidate>> {
     let sql = format!(
         "SELECT chunks_fts.rowid, c.doc_id, bm25(chunks_fts, {BM25_WEIGHTS}) AS s
          FROM chunks_fts
@@ -830,20 +873,15 @@ fn fts_stream(store: &Store, expr: &str, filter: &Filter) -> Result<Vec<Candidat
                 raw: r.get(2)?,
             })
         })
-        .map_err(fts_error)?;
+        .map_err(|e| match_error(e, user_expression))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(fts_error)
-}
-
-/// Lowercase with every non-alphanumeric run collapsed to one space, so
-/// `kvault-rebuild-decision` and `Kvault: rebuild decision` compare equal.
-fn normalize_title(s: &str) -> String {
-    alnum_runs(s).join(" ")
+        .map_err(|e| match_error(e, user_expression))
 }
 
 /// The title stream is a precision stream: every positive unit (ignoring
 /// words shorter than `PREFIX_MIN_LEN`, which match too much) must appear
-/// in the normalized title. Shorter titles rank first because they are
+/// in the title as whole words, or as the start of one for a prefix term,
+/// the way `FTS5` would match it: `log` finds "Logging", not "Catalog". Shorter titles rank first because they are
 /// more specific. Titles are compared in Rust rather than SQL so the
 /// normalisation matches the query's, and 5k titles is a trivial scan.
 fn title_stream(
@@ -853,11 +891,10 @@ fn title_stream(
     best_chunk: &HashMap<i64, i64>,
     excluded: &HashSet<i64>,
 ) -> Result<Vec<Candidate>> {
-    let needles: Vec<String> = query
+    let needles: Vec<&Unit> = query
         .positive
         .iter()
-        .map(Unit::needle)
-        .filter(|n| n.chars().count() >= PREFIX_MIN_LEN)
+        .filter(|u| u.needle().chars().count() >= PREFIX_MIN_LEN)
         .collect();
     if needles.is_empty() {
         return Ok(Vec::new());
@@ -878,11 +915,12 @@ fn title_stream(
     let mut matched: Vec<(i64, usize)> = titles
         .into_iter()
         .filter_map(|(id, title)| {
-            let norm = normalize_title(&title);
+            let runs = alnum_runs(&title);
+            let len = runs.iter().map(|r| r.len() + 1).sum::<usize>();
             needles
                 .iter()
-                .all(|n| norm.contains(n.as_str()))
-                .then_some((id, norm.len()))
+                .all(|u| u.in_runs(&runs))
+                .then_some((id, len))
         })
         .collect();
     matched.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -1011,6 +1049,9 @@ struct Fused {
     siblings: Vec<i64>,
     /// For a capped index chunk: the target chunk and the score before.
     cap: Option<(i64, f64)>,
+    /// For an index chunk: the best candidate chunk it points to, capped or
+    /// not, so the final score can be held below the target's too.
+    points_to: Option<i64>,
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1027,6 +1068,7 @@ fn fuse(streams: &[Stream]) -> Vec<Fused> {
                 streams: Vec::new(),
                 siblings: Vec::new(),
                 cap: None,
+                points_to: None,
             });
             entry.rrf += contribution;
             entry.streams.push(StreamRank {
@@ -1042,8 +1084,9 @@ fn fuse(streams: &[Stream]) -> Vec<Fused> {
 
 /// Cap each [`INDEX_FILE`] chunk below the best candidate document linked
 /// from its query-matching lines. Runs before collapse and pruning, on
-/// fused scores, so the pruning bound stays sound; pointer and target share
-/// a root, so the order survives the authority multiplier.
+/// fused scores, so the pruning bound stays sound. Pointer and target share
+/// a root but not always an authority (`pinned`, a `demote` glob), so
+/// [`load_hits`] repeats the cap on the final scores.
 fn cap_index_pointers(store: &Store, query: &Query, fused: &mut [Fused]) -> Result<()> {
     if fused.is_empty() {
         return Ok(());
@@ -1110,6 +1153,7 @@ fn cap_index_pointers(store: &Store, query: &Query, fused: &mut [Fused]) -> Resu
             .filter_map(|d| best.get(d))
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         if let Some(&(rrf, chunk)) = target {
+            f.points_to = Some(chunk);
             let cap = rrf * INDEX_CAP_RATIO;
             if f.rrf > cap {
                 f.cap = Some((chunk, f.rrf));
@@ -1128,17 +1172,7 @@ fn line_matches(query: &Query, line: &str) -> bool {
         return true;
     }
     let runs = alnum_runs(line);
-    let term =
-        |word: &str, prefix: bool, run: &str| run == word || (prefix && run.starts_with(word));
-    query.positive.iter().any(|u| match u {
-        Unit::Term { word, prefix } => runs.iter().any(|r| term(word, *prefix, r)),
-        Unit::Phrase(ws) => {
-            !ws.is_empty()
-                && runs
-                    .windows(ws.len())
-                    .any(|w| w.iter().zip(ws).all(|(a, b)| a == b))
-        }
-    })
+    query.positive.iter().any(|u| u.in_runs(&runs))
 }
 
 /// Keep the best chunk per document; the rest become its siblings. Done
@@ -1252,18 +1286,32 @@ fn load_hits(store: &Store, fused: &[Fused]) -> Result<Vec<Hit>> {
         .map(|(id, h)| (*id, h.chunk.id.clone()))
         .collect();
     let mut out = Vec::with_capacity(fused.len());
+    // Final score of each placed chunk; targets place before their pointers.
+    let mut placed: HashMap<i64, f64> = HashMap::new();
     for f in fused {
         let Some(mut hit) = by_chunk.remove(&f.chunk_id) else {
             continue;
         };
         let auth = hit.score;
-        hit.score = f.rrf * auth;
+        // An index chunk stays below its target after authority as well: a
+        // demoted target, or a pinned index, would otherwise swap them back.
+        // Lowering the fused score keeps `rrf × authority = score` true.
+        let (mut rrf, mut cap) = (f.rrf, f.cap);
+        if let Some(target) = f.points_to
+            && let Some(&target_score) = placed.get(&target)
+            && rrf * auth > target_score * INDEX_CAP_RATIO
+        {
+            cap = Some((target, cap.map_or(rrf, |(_, before)| before)));
+            rrf = target_score * INDEX_CAP_RATIO / auth;
+        }
+        hit.score = rrf * auth;
+        placed.insert(f.chunk_id, hit.score);
         hit.explain = Explain {
             streams: f.streams.clone(),
-            rrf: f.rrf,
+            rrf,
             authority: auth,
             demoted: hit.explain.demoted,
-            index_cap: f.cap.and_then(|(target, rrf_before)| {
+            index_cap: cap.and_then(|(target, rrf_before)| {
                 short_ids.get(&target).map(|below| IndexCap {
                     below: below.clone(),
                     rrf_before,
@@ -1503,11 +1551,18 @@ mod tests {
     }
 
     #[test]
-    fn titles_normalise_like_queries() {
-        assert_eq!(
-            normalize_title("Kvault: rebuild-decision (v0)"),
-            "kvault rebuild decision v0"
-        );
+    fn units_match_whole_words_like_the_tokenizer() {
+        let runs = |s: &str| alnum_runs(s);
+        let log = term("log", true);
+        assert!(log.in_runs(&runs("Logging: the plan")));
+        assert!(log.in_runs(&runs("the log")));
+        assert!(!log.in_runs(&runs("Catalog of dialogs")));
+        // Quoted, so exact.
+        assert!(!term("cat", false).in_runs(&runs("Concatenate, category")));
+        let phrase = Unit::Phrase(vec!["cold".into(), "start".into()]);
+        assert!(phrase.in_runs(&runs("Kvault: cold-start (v0)")));
+        assert!(!phrase.in_runs(&runs("start cold")));
+        assert!(!phrase.in_runs(&runs("scold starts")));
     }
 
     #[test]

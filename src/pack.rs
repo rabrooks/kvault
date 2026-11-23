@@ -152,17 +152,33 @@ pub fn pack_from(
     }
 }
 
+/// Text read from line `first_line` of a file, as the packer shows it: see
+/// [`trim`]. Only text that starts the file can start with frontmatter; a
+/// chunk further down that begins at a `---` rule is all body, and none of
+/// it may be dropped.
+#[must_use]
+pub fn trim_from(text: &str, first_line: u32) -> String {
+    if first_line <= 1 {
+        trim(text)
+    } else {
+        squeeze(text)
+    }
+}
+
 /// Text as the packer shows it: no frontmatter block, no trailing whitespace
 /// on a line, at most one blank line in a row, no leading or trailing blank
 /// lines. Nothing inside a line is rewritten, so `path:line` citations and
-/// code fences survive. Chunks never start with frontmatter, but a stale
-/// line-window read of a changed file can.
+/// code fences survive.
 #[must_use]
 pub fn trim(text: &str) -> String {
     let (_, body_start) = split_frontmatter(text);
+    squeeze(&text[body_start..])
+}
+
+fn squeeze(text: &str) -> String {
     let mut out = String::new();
     let mut blank_pending = false;
-    for line in text[body_start..].lines() {
+    for line in text.lines() {
         let line = line.trim_end();
         if line.is_empty() {
             blank_pending = !out.is_empty();
@@ -233,6 +249,16 @@ mod tests {
             trim("no frontmatter\n---\nrule"),
             "no frontmatter\n---\nrule\n"
         );
+    }
+
+    /// A chunk cut at a horizontal rule can look like frontmatter. It is
+    /// only that at the top of the file.
+    #[test]
+    fn only_text_from_line_one_loses_frontmatter() {
+        let t = "---\nDecision: sqlite\nOwner: x\n---\nand the rest\n";
+        assert_eq!(trim_from(t, 1), "and the rest\n");
+        assert_eq!(trim_from(t, 40), t);
+        assert_eq!(trim_from("a   \n\n\n\nb\n", 40), "a\n\nb\n");
     }
 
     #[test]

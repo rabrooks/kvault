@@ -10,6 +10,7 @@ use common::{Fixture, fixture, write};
 use kvault::cli::SearchFormat;
 use kvault::get::{self, Target};
 use kvault::index::{self, IndexOptions};
+use kvault::list::{self, ListFilter};
 use kvault::render;
 use kvault::search::{self, Query, SearchOptions};
 use predicates::prelude::*;
@@ -461,4 +462,112 @@ fn cli_search_get_and_bench_round_trip() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("below"));
+}
+
+/// In `lex:` mode FTS evaluates the expression; the title and tag streams
+/// work from an approximation of it and must not add documents it rejected.
+#[test]
+fn lex_expressions_are_not_widened_by_the_title_and_tag_streams() {
+    let fx = fixture();
+    // `cross.md` is tagged `design`, `sub/arch.md` is titled Architecture:
+    // each satisfies one side of an AND, neither both.
+    for q in [
+        "lex: kubernetes AND design",
+        "lex: kubernetes AND architecture",
+    ] {
+        let hits = run(&fx, q, &opts());
+        assert!(hits.is_empty(), "{q}: {:?}", paths(&hits));
+    }
+    // A document FTS matched is still boosted by its title.
+    let hits = run(&fx, "lex: architecture", &opts());
+    assert_eq!(hits[0].chunk.doc.rel_path, "sub/arch.md");
+    assert!(
+        hits[0].explain.streams.iter().any(|s| s.stream == "title"),
+        "{:?}",
+        hits[0].explain.streams
+    );
+}
+
+#[test]
+fn a_malformed_lex_expression_is_a_syntax_error() {
+    let fx = fixture();
+    for q in [
+        "lex: \"unterminated",
+        "lex: nosuchcolumn:word",
+        "lex: a AND",
+    ] {
+        let err = search::run(&fx.store, &Query::parse(q), &opts())
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("bad query syntax: "), "{q}: {err}");
+    }
+}
+
+/// Titles match on words, as FTS does, not on substrings.
+#[test]
+fn title_stream_matches_words_not_substrings() {
+    let fx = fixture();
+    write(
+        &fx.base.join("proj-b/notes/catalog.md"),
+        "# Catalog\n\nAn inventory of parts, with nothing about journals in it.\n",
+    );
+    write(
+        &fx.base.join("proj-b/notes/logging.md"),
+        "# Logging\n\nHow the service writes its journal.\n",
+    );
+    let mut fx = fx;
+    index::run(&fx.config, &mut fx.store, &IndexOptions::default()).unwrap();
+    let hits = run(&fx, "log", &opts());
+    assert_eq!(paths(&hits), ["logging.md"]);
+}
+
+/// Two chunks of one document whose ids share the printed prefix but whose
+/// text differs: `get` must not pick one silently.
+#[test]
+fn an_id_shared_by_different_chunks_of_one_document_is_ambiguous() {
+    let fx = fixture();
+    let set = |a: &str, b: &str| {
+        fx.store
+            .conn()
+            .execute(
+                "UPDATE chunks SET blake3 = CASE ordinal WHEN 0 THEN ?1 ELSE ?2 END
+                 WHERE ordinal < 2 AND doc_id = (SELECT id FROM docs WHERE rel_path = 'plan.md')",
+                [a, b],
+            )
+            .unwrap()
+    };
+    assert_eq!(set("deadbeef0000aaaa", "deadbeef0000bbbb"), 2);
+    let err = get::chunk_by_id(&fx.store, "deadbeef")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("matches 2 different chunks of one document")
+            && err.contains("proj-a/notes/plan.md:1"),
+        "{err}"
+    );
+    // A longer prefix tells them apart.
+    assert!(get::chunk_by_id(&fx.store, "deadbeef0000b").is_ok());
+    // The same text twice in one file is not ambiguous: either will do.
+    set("deadbeef0000cccc", "deadbeef0000cccc");
+    assert!(get::chunk_by_id(&fx.store, "deadbeef").is_ok());
+}
+
+#[test]
+fn list_root_ignores_a_trailing_slash() {
+    let fx = fixture();
+    let root = fx.base.join("proj-b/notes");
+    let count = |root: String| {
+        list::run(
+            &fx.store,
+            &ListFilter {
+                root: Some(root),
+                ..ListFilter::default()
+            },
+        )
+        .unwrap()
+        .len()
+    };
+    let plain = count(root.to_string_lossy().into_owned());
+    assert!(plain > 0);
+    assert_eq!(count(format!("{}/", root.display())), plain);
 }

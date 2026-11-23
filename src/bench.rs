@@ -68,7 +68,9 @@ pub struct CaseResult {
     pub millis: f64,
     /// The case expects an answer.
     pub answerable: bool,
-    /// `recall` found nothing or reported a weak match.
+    /// `recall` held back: it reported a weak match, or, for a case that
+    /// expects no answer, found nothing. An answerable case with no hits is
+    /// a miss, not a weak match.
     pub quiet: bool,
     /// Best share of the query in the top hits, when meaningful.
     pub coverage: Option<f64>,
@@ -144,8 +146,25 @@ struct Expected<'a> {
 
 impl<'a> Expected<'a> {
     fn parse(s: &'a str) -> Self {
-        match s.split_once('#') {
-            Some((p, h)) if !h.is_empty() => Self {
+        // The heading follows the file name; a `#` inside the name
+        // (`c#-notes.md`) is part of the path.
+        let lower = s.to_ascii_lowercase();
+        let at = match lower.find(".md#") {
+            Some(i) => Some(i + ".md".len()),
+            None if std::path::Path::new(&lower)
+                .extension()
+                .is_some_and(|ext| ext == "md") =>
+            {
+                None
+            }
+            None => s.find('#'),
+        };
+        match at.map(|i| (&s[..i], &s[i + 1..])) {
+            Some((p, "")) => Self {
+                path: p.trim_end_matches('/'),
+                heading: None,
+            },
+            Some((p, h)) => Self {
                 path: p.trim_end_matches('/'),
                 heading: Some(h.to_lowercase()),
             },
@@ -318,7 +337,7 @@ pub fn run(store: &Store, cases: &[Case], opts: &BenchOptions) -> Result<Report>
                 format: RecallFormat::Md,
             },
         )?;
-        result.quiet = packed.weak || packed.total == 0;
+        result.quiet = packed.weak || (!result.answerable && packed.total == 0);
         result.coverage = packed.coverage;
         if result.answerable {
             recall_tokens += packed.tokens;
@@ -538,7 +557,24 @@ mod tests {
         assert!(e.path_matches(&["proj/notes/plan.md".into()]));
         assert!(!e.path_matches(&["proj/notes/myplan.md".into()]));
         assert_eq!(e.heading.as_deref(), Some("phase one"));
-        assert!(Expected::parse("plan.md#").heading.is_none());
+        let bare = Expected::parse("plan.md#");
+        assert_eq!((bare.path, bare.heading), ("plan.md", None));
+        // A `#` in the file name is not a heading separator.
+        let sharp = Expected::parse("notes/c#-notes.md");
+        assert_eq!(
+            (sharp.path, sharp.heading.as_deref()),
+            ("notes/c#-notes.md", None)
+        );
+        let sharp = Expected::parse("notes/C#-notes.MD#Generics");
+        assert_eq!(
+            (sharp.path, sharp.heading.as_deref()),
+            ("notes/C#-notes.MD", Some("generics"))
+        );
+        // No file name: the old reading, a directory and a heading.
+        assert_eq!(
+            Expected::parse("notes#intro").heading.as_deref(),
+            Some("intro")
+        );
     }
 
     #[test]

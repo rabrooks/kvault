@@ -208,42 +208,54 @@ pub fn window(text: &str, from: u32, count: u32) -> String {
 /// Find the chunk whose `BLAKE3` starts with `prefix`.
 ///
 /// # Errors
-/// Returns an error if no chunk matches or the prefix is ambiguous across
-/// documents (identical text in two files is reported as both).
+/// Returns an error if no chunk matches or the prefix is ambiguous: across
+/// documents (identical text in two files is reported as both), or between
+/// chunks of one document whose text differs.
 pub fn chunk_by_id(store: &Store, prefix: &str) -> Result<ChunkRef> {
     let upper = format!("{prefix}g");
     let sql = format!(
-        "SELECT {CHUNK_REF_COLUMNS}
+        "SELECT {CHUNK_REF_COLUMNS}, c.blake3
          FROM chunks c JOIN docs d ON d.id = c.doc_id JOIN roots r ON r.id = d.root_id
          WHERE c.blake3 >= ?1 AND c.blake3 < ?2 AND d.active = 1 AND r.present = 1
          ORDER BY d.id, c.ordinal"
     );
     let mut stmt = store.conn().prepare_cached(&sql)?;
     let rows = stmt
-        .query_map([prefix, upper.as_str()], chunk_ref_from_row)?
+        .query_map([prefix, upper.as_str()], |r| {
+            Ok((chunk_ref_from_row(r)?, r.get::<_, String>(13)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // First chunk per document, and per full hash. Chunks with the same full
+    // hash have the same text; chunks that only share the prefix do not.
     let mut docs: Vec<&ChunkRef> = Vec::new();
-    for c in &rows {
+    let mut texts: Vec<(&ChunkRef, &str)> = Vec::new();
+    for (c, hash) in &rows {
         if !docs.iter().any(|d| d.doc.doc_id == c.doc.doc_id) {
             docs.push(c);
         }
+        if !texts.iter().any(|(_, h)| h == hash) {
+            texts.push((c, hash));
+        }
     }
-    match docs.len() {
-        0 => Err(Error::Other(anyhow::anyhow!(
+    let places = |chunks: &mut dyn Iterator<Item = &ChunkRef>| -> String {
+        chunks
+            .map(|c| format!("  {}:{}", c.doc.display_path(), c.start_line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match (docs.len(), texts.len()) {
+        (0, _) => Err(Error::Other(anyhow::anyhow!(
             "no chunk with id {prefix} (index out of date? run `kvault index`)"
         ))),
-        1 => Ok(docs[0].clone()),
-        _ => {
-            let list: Vec<String> = docs
-                .iter()
-                .map(|c| format!("  {}:{}", c.doc.display_path(), c.start_line))
-                .collect();
-            Err(Error::Other(anyhow::anyhow!(
-                "id {prefix} matches chunks in {} documents; use a path:\n{}",
-                docs.len(),
-                list.join("\n")
-            )))
-        }
+        (1, 1) => Ok(docs[0].clone()),
+        (1, n) => Err(Error::Other(anyhow::anyhow!(
+            "id {prefix} matches {n} different chunks of one document; use a path and line:\n{}",
+            places(&mut texts.iter().map(|(c, _)| *c))
+        ))),
+        (n, _) => Err(Error::Other(anyhow::anyhow!(
+            "id {prefix} matches chunks in {n} documents; use a path:\n{}",
+            places(&mut docs.iter().copied())
+        ))),
     }
 }
 

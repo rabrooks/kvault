@@ -128,7 +128,9 @@ impl Prepared {
             None
         };
         let stale = text.as_ref().is_some_and(|t| t.stale);
-        let trimmed = text.as_ref().map(|t| pack::trim(&t.text));
+        let trimmed = text
+            .as_ref()
+            .map(|t| pack::trim_from(&t.text, t.first_line));
         let c = &hit.chunk;
         let mut header = format!(
             "#{}  {}:{}-{}  \"{}\"",
