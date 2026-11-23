@@ -40,7 +40,7 @@ pub const TOKENIZER_ID: &str = "bytes36";
 /// tags, title rules) or the chunk id derivation changes. Each root records
 /// the version it was parsed with; a mismatch forces every file under it to
 /// be re-parsed on the next run.
-pub const PARSER_VERSION: &str = "2";
+pub const PARSER_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
@@ -193,8 +193,11 @@ pub fn run(config: &Config, store: &mut Store, opts: &IndexOptions) -> Result<In
 
     for root in selected {
         let (root_id, reparse) = upsert_root(&tx, root)?;
+        let errors_before = report.errors;
         let clean = index_root(&tx, root_id, root, opts, reparse, &mut report)?;
-        if clean {
+        // A file that could not be read keeps its rows from the old parser:
+        // the root is not on the new version until every file is.
+        if clean && report.errors == errors_before {
             tx.execute(
                 "UPDATE roots SET parser_version = ?1 WHERE id = ?2",
                 params![PARSER_VERSION, root_id],
@@ -347,9 +350,12 @@ fn index_root(
 
     // Active rows whose path was not seen: rename candidates first, then
     // deletions. Keyed by hash with a list, since files may share content.
+    // After an incomplete walk an unseen file is more likely unread than
+    // gone, so it is neither deleted nor taken over by a new file that
+    // happens to share its content.
     let mut vanished: HashMap<String, Vec<(String, i64)>> = HashMap::new();
     for (path, row) in &existing {
-        if row.active && !seen.contains(path) {
+        if walk_errors == 0 && row.active && !seen.contains(path) {
             vanished
                 .entry(row.blake3.clone())
                 .or_default()
@@ -572,13 +578,21 @@ fn walk(root: &Path) -> (Vec<FileStat>, usize) {
                 continue;
             }
         };
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // The stored path must name the file again when joined to the root,
+        // so a name that is not UTF-8 cannot be indexed at all. Only Windows
+        // separates with `\`; elsewhere it is an ordinary character, and
+        // folding it would make `a\b.md` collide with `a/b.md`.
+        let Some(rel) = path.strip_prefix(root).unwrap_or(path).to_str() else {
+            eprintln!(
+                "warning: skipping {}: its name is not valid UTF-8",
+                path.display()
+            );
+            continue;
+        };
+        #[cfg(windows)]
+        let rel = rel.replace('\\', "/");
         out.push(FileStat {
-            rel_path: rel,
+            rel_path: rel.to_owned(),
             abs_path: path.to_path_buf(),
             mtime_ns,
             size: i64::try_from(len).unwrap_or(i64::MAX),
@@ -714,10 +728,11 @@ fn clear_doc_children(tx: &Transaction<'_>, id: i64) -> Result<()> {
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE doc_id = ?1)",
         params![id],
     )?;
+    // Observations before chunks, so the chunk delete has nothing to cascade to.
+    tx.execute("DELETE FROM observations WHERE doc_id = ?1", params![id])?;
     tx.execute("DELETE FROM chunks WHERE doc_id = ?1", params![id])?;
     tx.execute("DELETE FROM links WHERE from_doc_id = ?1", params![id])?;
     tx.execute("DELETE FROM tags WHERE doc_id = ?1", params![id])?;
-    tx.execute("DELETE FROM observations WHERE doc_id = ?1", params![id])?;
     Ok(())
 }
 
@@ -802,7 +817,12 @@ pub(crate) fn normalize_date(s: &str) -> Option<String> {
 /// Resolve every link's `to_doc_id` from scratch so incremental runs produce
 /// the same graph as a full rebuild. Returns how many remain unresolved.
 /// Order: relative path in the same root, file stem in the same root, title in
-/// the same root, then the same three across all roots.
+/// the same root, then the same three across all roots, where the first by
+/// root path and file path wins so the choice does not depend on the order
+/// documents were first indexed in. Documents of a root that is absent are
+/// not candidates: no result can show them. Only links whose target changed
+/// are written, since this runs on every index, single-root hook runs
+/// included.
 fn resolve_links(tx: &Transaction<'_>) -> Result<usize> {
     struct DocKey {
         id: i64,
@@ -812,8 +832,12 @@ fn resolve_links(tx: &Transaction<'_>) -> Result<usize> {
         title: String,
     }
     let docs: Vec<DocKey> = {
-        let mut stmt =
-            tx.prepare("SELECT id, root_id, rel_path, title FROM docs WHERE active = 1")?;
+        let mut stmt = tx.prepare(
+            "SELECT d.id, d.root_id, d.rel_path, d.title
+                 FROM docs d JOIN roots r ON r.id = d.root_id
+                 WHERE d.active = 1 AND r.present = 1
+                 ORDER BY r.path, d.rel_path",
+        )?;
         let rows = stmt.query_map([], |r| {
             let rel_path: String = r.get(2)?;
             let stem = Path::new(&rel_path)
@@ -841,13 +865,20 @@ fn resolve_links(tx: &Transaction<'_>) -> Result<usize> {
         by_title.entry(d.title.as_str()).or_default().push(d);
     }
 
-    let links: Vec<(i64, i64, String, String, String)> = {
+    let links: Vec<(i64, i64, String, String, String, Option<i64>)> = {
         let mut stmt = tx.prepare(
-            "SELECT l.rowid, d.root_id, d.rel_path, l.target, l.link_type
+            "SELECT l.rowid, d.root_id, d.rel_path, l.target, l.link_type, l.to_doc_id
              FROM links l JOIN docs d ON d.id = l.from_doc_id",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?;
         rows.filter_map(std::result::Result::ok).collect()
     };
@@ -863,7 +894,7 @@ fn resolve_links(tx: &Transaction<'_>) -> Result<usize> {
 
     let mut remaining = 0;
     let mut upd = tx.prepare_cached("UPDATE links SET to_doc_id = ?1 WHERE rowid = ?2")?;
-    for (rowid, root_id, from_rel, target, link_type) in links {
+    for (rowid, root_id, from_rel, target, link_type, current) in links {
         let resolved = if link_type == "md" {
             let joined = normalize_relative(&from_rel, &target);
             by_path.get(&(root_id, joined.as_str())).copied()
@@ -880,7 +911,9 @@ fn resolve_links(tx: &Transaction<'_>) -> Result<usize> {
                 .or_else(|| pick(by_stem.get(stem_key.as_str()), root_id))
                 .or_else(|| pick(by_title.get(key.as_str()), root_id))
         };
-        upd.execute(params![resolved, rowid])?;
+        if resolved != current {
+            upd.execute(params![resolved, rowid])?;
+        }
         if resolved.is_none() {
             remaining += 1;
         }

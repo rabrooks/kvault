@@ -108,7 +108,7 @@ impl Files {
     fn read(&mut self, chunk: &ChunkRef) -> Option<Text> {
         let entry = self.0.entry(chunk.doc.doc_id).or_insert_with(|| {
             let path = chunk.doc.abs_path();
-            std::fs::read_to_string(&path)
+            get::read_as_indexed(&path)
                 .ok()
                 .map(|file| (file, get::is_stale(&path, chunk.doc.mtime_ns)))
         });

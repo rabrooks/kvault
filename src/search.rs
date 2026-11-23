@@ -1118,7 +1118,7 @@ fn cap_index_pointers(store: &Store, query: &Query, fused: &mut [Fused]) -> Resu
     for row in rows {
         let (chunk, target, line, doc, root, rel) = row?;
         let lines = files.entry(doc).or_insert_with(|| {
-            std::fs::read_to_string(Path::new(&root).join(&rel))
+            crate::get::read_as_indexed(&Path::new(&root).join(&rel))
                 .ok()
                 .map(|t| t.lines().map(str::to_owned).collect())
         });

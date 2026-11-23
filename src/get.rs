@@ -165,8 +165,18 @@ pub fn is_stale(path: &Path, indexed_mtime_ns: i64) -> bool {
 pub fn read_chunk(chunk: &ChunkRef) -> Result<Text> {
     let path = chunk.doc.abs_path();
     let stale = is_stale(&path, chunk.doc.mtime_ns);
-    let file = std::fs::read_to_string(&path)?;
+    let file = read_as_indexed(&path)?;
     Ok(slice_chunk(&file, chunk, stale))
+}
+
+/// Read a file the way the indexer did: invalid UTF-8 decoded lossily. The
+/// stored byte offsets are into that text, and a file that was indexed must
+/// stay readable, so every reader of indexed files goes through here.
+///
+/// # Errors
+/// Returns an error if the file cannot be read.
+pub fn read_as_indexed(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
 }
 
 /// [`read_chunk`] over file text the caller already read, so one read can
@@ -366,7 +376,7 @@ pub fn run(store: &Store, target: &Target, whole_doc: bool) -> Result<String> {
 }
 
 fn render_doc(doc: &DocRef, from: Option<u32>, count: Option<u32>) -> Result<String> {
-    let file = std::fs::read_to_string(doc.abs_path())?;
+    let file = read_as_indexed(&doc.abs_path())?;
     let stale = is_stale(&doc.abs_path(), doc.mtime_ns);
     let total = u32::try_from(file.lines().count()).unwrap_or(u32::MAX);
     let (from, count) = match (from, count) {

@@ -12,7 +12,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use crate::error::{Error, Result};
 
 /// Current schema version. Bump with every DDL change.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Minimum `SQLite` version: `FTS5` `contentless_delete` arrived in 3.43.0.
 pub const MIN_SQLITE_VERSION: i32 = 3_043_000;
@@ -133,6 +133,13 @@ const MIGRATE_V4: &str = "
 ALTER TABLE roots ADD COLUMN present INTEGER NOT NULL DEFAULT 1;
 ";
 
+/// v5: `observations` is deleted from by document and cascaded to from
+/// chunks; without these every deleted chunk scanned the whole table.
+const MIGRATE_V5: &str = "
+CREATE INDEX observations_doc ON observations(doc_id);
+CREATE INDEX observations_chunk ON observations(chunk_id);
+";
+
 /// `meta` key holding the configured project aliases as a JSON object,
 /// alias → canonical name. Written by `index` so readers that never load
 /// the config (search, list, brief) resolve names the same way.
@@ -242,6 +249,10 @@ impl Store {
         if current == 3 {
             self.conn.execute_batch(MIGRATE_V4)?;
             current = 4;
+        }
+        if current == 4 {
+            self.conn.execute_batch(MIGRATE_V5)?;
+            current = 5;
         }
         debug_assert_eq!(current, SCHEMA_VERSION);
         self.conn.execute(
@@ -375,7 +386,17 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("4"));
+        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("5"));
+        let indexes: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('observations_doc', 'observations_chunk')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2);
         let tables: Vec<String> = s
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table') ORDER BY name")
@@ -492,6 +513,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pv, None, "migrated roots are marked for re-parse");
+        let plan: String = s
+            .conn()
+            .query_row(
+                "EXPLAIN QUERY PLAN DELETE FROM observations WHERE doc_id = 1",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("observations_doc"), "{plan}");
     }
 
     #[test]
