@@ -18,6 +18,7 @@ use crate::error::Result;
 use crate::get::{self, CHUNK_REF_COLUMNS, ChunkRef, DocRef, chunk_ref_from_row};
 use crate::list::{self, ListFilter};
 use crate::pack::{self, ByteHeuristic, TokenCounter};
+use crate::roots::path_slug;
 use crate::store::Store;
 
 /// Claude Code swaps hook output over 10,000 characters for a file path and
@@ -211,27 +212,60 @@ fn ago(t: jiff::Timestamp) -> String {
     }
 }
 
-/// The project a directory belongs to: the nearest ancestor (the directory
-/// itself first) whose name is a project some root was configured with, or
-/// an alias of one. Returns the canonical name.
+/// The project a directory belongs to. For each ancestor, the directory
+/// itself first, the project is:
+///
+/// - the ancestor's name, when it is a project some root was configured
+///   with, or an alias of one; else
+/// - the project of the Claude memory root kept for that exact directory
+///   (`…/<slug of the ancestor's path>/memory`). The slug flattens `/`, `_`
+///   and `.` to `-`, so `~/Projects/aws_terraform` has the memory project
+///   `aws-terraform` and `~/dotfiles/nvim` has `dotfiles-nvim`: neither is
+///   the name of a directory, and only the slug ties them to their memory.
+///
+/// Returns the canonical name.
 ///
 /// # Errors
 /// Returns an error if the roots cannot be read.
 pub fn project_for(store: &Store, cwd: &Path) -> Result<Option<String>> {
-    let known: Vec<String> = store
+    let roots: Vec<(String, String)> = store
         .conn()
         .prepare_cached(
-            "SELECT DISTINCT project FROM roots WHERE project IS NOT NULL AND present = 1",
+            "SELECT path, project FROM roots WHERE project IS NOT NULL AND present = 1",
         )?
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
+    // Slug of the directory a memory root belongs to → that root's project.
+    let by_slug: HashMap<&str, &str> = roots
+        .iter()
+        .filter_map(|(path, project)| {
+            let slug = Path::new(path).parent()?.file_name()?.to_str()?;
+            slug.starts_with('-').then_some((slug, project.as_str()))
+        })
+        .collect();
     let aliases = store.project_aliases()?;
-    let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    Ok(dir
-        .ancestors()
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .map(|name| aliases.get(&name).cloned().unwrap_or(name))
-        .find(|name| known.contains(name)))
+    let known = |name: &str| roots.iter().any(|(_, project)| project == name);
+
+    // Claude Code slugs the path it was started in, which a symlink can make
+    // differ from the canonical one: try the canonical path, then the given.
+    let canonical = std::fs::canonicalize(cwd).ok();
+    let given = (canonical.as_deref() != Some(cwd)).then_some(cwd);
+    for dir in canonical.as_deref().into_iter().chain(given) {
+        for ancestor in dir.ancestors() {
+            if let Some(name) = ancestor.file_name().map(|n| n.to_string_lossy()) {
+                let name = aliases
+                    .get(name.as_ref())
+                    .map_or(name.as_ref(), String::as_str);
+                if known(name) {
+                    return Ok(Some(name.to_owned()));
+                }
+            }
+            if let Some(project) = by_slug.get(path_slug(ancestor).as_str()) {
+                return Ok(Some((*project).to_owned()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 const DOC_COLUMNS: &str = "d.id, r.path, r.project, d.rel_path, d.title, d.mtime_ns, d.updated";

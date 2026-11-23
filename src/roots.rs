@@ -183,7 +183,8 @@ fn claude_slug_project_with_home(slug: &str, home_slug: Option<&str>) -> Option<
 }
 
 /// `/Users/karl.meiser` → `-Users-karl-meiser` (Claude Code's directory slug).
-fn path_slug(path: &Path) -> String {
+#[must_use]
+pub fn path_slug(path: &Path) -> String {
     path.to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
