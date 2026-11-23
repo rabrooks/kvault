@@ -10,7 +10,7 @@ hooks; an MCP adapter is planned.
 
 ## Status
 
-**0.2.0, beta, in trial use.** Indexing, search, budgeted recall, the session brief, the
+**0.3.0, beta, in trial use.** Indexing, search, budgeted recall, the session brief, the
 Claude Code hooks and skill, session capture, `add`, the query log and `report` all work.
 Two commands are declared but not built, and exit with code 3 saying so: `links` (link
 neighbours of a note) and `serve` (an MCP stdio adapter, behind `--features mcp`). Links
