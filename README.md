@@ -244,9 +244,11 @@ When the project has no `notes/` dir it goes to `[capture] fallback_dir` (defaul
 without being configured, as an `other` root named for the project. The note carries
 `kind: session`, the first prompt (its first line is the title, so the brief's recent
 list reads as a log), the last assistant message, and the files the
-transcript shows were read or edited. `<private>…</private>` spans are dropped and
-credential-shaped tokens (PEM blocks, `Bearer x`, AWS, GitHub, Slack, OpenAI, Anthropic
-and Google key prefixes) are replaced with `[redacted]`. Promoting a session note into a
+transcript shows were read or edited. In the title, the prompt and the response,
+`<private>…</private>` spans are dropped and credentials (PEM blocks, `Bearer x`, AWS,
+GitHub, Slack, OpenAI, Anthropic and Google key prefixes, and values assigned to names
+ending in `key`, `token`, `secret` or `password`) are replaced with `[redacted]`. The
+list is short on purpose: treat it as a safety net, not a guarantee. Promoting a session note into a
 durable note is the agent's job, through the skill and `kvault add`.
 
 ```
