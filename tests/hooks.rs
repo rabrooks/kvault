@@ -33,6 +33,11 @@ impl Env {
         cmd.env("KVAULT_CONFIG", &self.config);
         cmd.env("KVAULT_DB", self.fx.base.join("index.db"));
         cmd.env("KVAULT_LOG", &self.log);
+        // Tests that exercise the update check turn it back on, pointed at
+        // a local file; no test reaches crates.io.
+        cmd.env("KVAULT_NO_UPDATE_CHECK", "1");
+        cmd.env_remove("KVAULT_UPDATE_URL");
+        cmd.env_remove("CLAUDE_PLUGIN_ROOT");
         cmd
     }
 
@@ -522,4 +527,127 @@ fn session_start_gives_a_stale_brief_when_the_index_is_locked() {
         took < std::time::Duration::from_millis(3500),
         "waited {took:?} for the lock"
     );
+}
+
+fn start_input(e: &Env) -> String {
+    serde_json::json!({"session_id":"s1","cwd":e.fx.base.join("proj-a"),"source":"startup"})
+        .to_string()
+}
+
+fn write_plugin(dir: &Path, version: &str) {
+    write(
+        &dir.join(".claude-plugin/plugin.json"),
+        &format!(r#"{{"name":"kvault","version":"{version}"}}"#),
+    );
+}
+
+#[test]
+fn session_start_says_when_the_plugin_is_newer_than_the_binary() {
+    let e = env(None);
+    let plugin = e.fx.base.join("plugin");
+    write_plugin(&plugin, "99.0.0");
+    let out = e
+        .kvault()
+        .env("CLAUDE_PLUGIN_ROOT", &plugin)
+        .args(["hook", "session-start"])
+        .write_stdin(start_input(&e))
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(msg.contains("plugin is 99.0.0"), "{msg}");
+    assert!(msg.contains("cargo install kvault"), "{msg}");
+    // The brief is still there, and the notice is not in it.
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(!ctx.contains("cargo install"), "{ctx}");
+
+    write_plugin(&plugin, env!("CARGO_PKG_VERSION"));
+    let out = e
+        .kvault()
+        .env("CLAUDE_PLUGIN_ROOT", &plugin)
+        .args(["hook", "session-start"])
+        .write_stdin(start_input(&e))
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(v.get("systemMessage").is_none(), "{v}");
+}
+
+/// A sparse-index file served from disk in place of crates.io.
+fn local_index(e: &Env, versions: &[&str]) -> String {
+    let lines: Vec<String> = versions
+        .iter()
+        .map(|v| serde_json::json!({"name":"kvault","vers":v,"yanked":false}).to_string())
+        .collect();
+    let path = e.fx.base.join("index-file");
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    format!("file://{}", path.display())
+}
+
+#[test]
+fn session_start_refreshes_in_the_background_then_tells_once() {
+    let e = env(None);
+    let url = local_index(&e, &["0.1.0", "99.0.0"]);
+    let cache = e.fx.base.join("latest-release.json");
+    let hook = || {
+        let out = e
+            .kvault()
+            .env_remove("KVAULT_NO_UPDATE_CHECK")
+            .env("KVAULT_UPDATE_URL", &url)
+            .args(["hook", "session-start"])
+            .write_stdin(start_input(&e))
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // First session: nothing known yet, so no notice; a refresh starts.
+    assert!(hook().get("systemMessage").is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_to_string(&cache)
+        .unwrap_or_default()
+        .contains("99.0.0")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background refresh never wrote the cache"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Next session: told once, then not again.
+    let v = hook();
+    let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(msg.contains("kvault 99.0.0 is available"), "{msg}");
+    assert!(hook().get("systemMessage").is_none());
+    assert_eq!(e.log(), "", "hook logged an error");
+}
+
+#[test]
+fn turned_off_the_release_check_writes_and_spawns_nothing() {
+    let e = env(None);
+    let url = local_index(&e, &["99.0.0"]);
+    let cache = e.fx.base.join("latest-release.json");
+    // Off by environment variable (the harness sets it)...
+    e.kvault()
+        .env("KVAULT_UPDATE_URL", &url)
+        .args(["hook", "session-start"])
+        .write_stdin(start_input(&e))
+        .assert()
+        .success();
+    // ...and by config.
+    let mut config = e.fx.config.clone();
+    config.update_check.enabled = false;
+    std::fs::write(&e.config, config.to_toml().unwrap()).unwrap();
+    e.kvault()
+        .env_remove("KVAULT_NO_UPDATE_CHECK")
+        .env("KVAULT_UPDATE_URL", &url)
+        .args(["hook", "session-start"])
+        .write_stdin(start_input(&e))
+        .assert()
+        .success();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!cache.exists(), "the release check ran while turned off");
 }

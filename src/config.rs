@@ -38,6 +38,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub brief: BriefConfig,
     pub query_log: QueryLogConfig,
+    pub update_check: UpdateCheckConfig,
     /// Path-prefix descriptions injected onto hits under that prefix.
     pub context: BTreeMap<String, String>,
     /// Per-project settings, keyed by the project's canonical name.
@@ -199,6 +200,19 @@ pub struct QueryLogConfig {
 }
 
 impl Default for QueryLogConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// The once-a-day look at crates.io for a newer kvault release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateCheckConfig {
+    pub enabled: bool,
+}
+
+impl Default for UpdateCheckConfig {
     fn default() -> Self {
         Self { enabled: true }
     }

@@ -5,7 +5,9 @@
 //! daily use can be audited. `SessionStart` output stays under Claude Code's
 //! 10,000-character cap because the brief caps itself at
 //! [`crate::brief::MAX_BYTES`]. Stop and `PreCompact` do no LLM work and
-//! finish in milliseconds.
+//! finish in milliseconds. `SessionStart` also carries upgrade notices from
+//! [`crate::update`] in `systemMessage`, which the user sees and the model
+//! does not; no hook waits on the network.
 
 use std::io::{Read, Write as _};
 use std::path::Path;
@@ -23,6 +25,7 @@ use crate::index::{self, IndexOptions};
 use crate::pack::{ByteHeuristic, TokenCounter};
 use crate::querylog;
 use crate::store::Store;
+use crate::update;
 
 /// Most stdin bytes a hook reads; Claude Code sends a few hundred.
 const STDIN_MAX: u64 = 1 << 20;
@@ -129,6 +132,7 @@ fn session_start(
     if matches!(input.source.as_deref(), Some("resume" | "fork")) {
         return Ok(json!({}));
     }
+    let notices = upgrade_notices(config);
     store.conn().busy_timeout(SESSION_START_BUSY_TIMEOUT)?;
     if !config.effective_roots().is_empty()
         && let Err(e) = index::run(
@@ -152,7 +156,7 @@ fn session_start(
         },
     )?;
     if brief.text.trim().is_empty() {
-        return Ok(json!({}));
+        return Ok(with_notices(json!({}), &notices));
     }
     let counts = store.counts()?;
     querylog::record_brief(
@@ -179,7 +183,38 @@ fn session_start(
                 .collect(),
         },
     );
-    Ok(session_start_output(&brief.text))
+    Ok(with_notices(session_start_output(&brief.text), &notices))
+}
+
+/// Upgrade notices for this session: the plugin newer than the binary
+/// (read from `CLAUDE_PLUGIN_ROOT`, set for plugin hooks), else a newer
+/// release from the cached check. Starts the background refresh when the
+/// cached answer is a day old.
+fn upgrade_notices(config: &Config) -> Vec<String> {
+    let plugin = std::env::var_os("CLAUDE_PLUGIN_ROOT")
+        .and_then(|root| update::plugin_notice(Path::new(&root)));
+    let mut notices: Vec<String> = plugin.into_iter().collect();
+    if update::enabled(config)
+        && let Some(path) = update::cache_path()
+    {
+        // The plugin notice already says to upgrade; the release notice
+        // waits for a session that does not have it.
+        let check = update::session_check(&path, jiff::Timestamp::now(), notices.is_empty());
+        if check.refresh {
+            update::spawn_refresh();
+        }
+        notices.extend(check.notice);
+    }
+    notices
+}
+
+/// `response` with `notices` as its `systemMessage`, when there are any.
+#[must_use]
+pub fn with_notices(mut response: Value, notices: &[String]) -> Value {
+    if !notices.is_empty() {
+        response["systemMessage"] = Value::String(notices.join("\n"));
+    }
+    response
 }
 
 /// The `SessionStart` response that injects `text` as context.

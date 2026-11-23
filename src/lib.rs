@@ -2,8 +2,8 @@
 //!
 //! Markdown files on disk are the only source of truth. kvault derives a
 //! disposable `SQLite` index (`FTS5` over heading-level chunks, links, tags) and
-//! exposes token-budgeted retrieval to agents through a CLI, Claude Code
-//! hooks, and an optional MCP adapter.
+//! exposes token-budgeted retrieval to agents through a CLI and Claude Code
+//! hooks; an MCP adapter is planned.
 //!
 //! # Module map
 //!
@@ -27,6 +27,7 @@
 //! | [`hooks`] | Claude Code hook entry points |
 //! | [`report`] | summary of the query log for a period |
 //! | [`querylog`] | local record of searches and which results were used |
+//! | [`update`] | plugin/binary mismatch and new-release notices |
 //! | [`cli`] | clap command definitions |
 
 pub mod add;
@@ -49,5 +50,6 @@ pub mod report;
 pub mod roots;
 pub mod search;
 pub mod store;
+pub mod update;
 
 pub use error::{Error, Result};

@@ -69,8 +69,9 @@ carries the hook definitions and the skill, and its hooks call `kvault` from `PA
 
 or, for a single session without installing, `claude --plugin-dir <path to a clone of this repo>`.
 
-Nothing is uploaded anywhere. kvault never
-moves or rewrites your notes: the only files it writes are session notes, notes you `add`,
+Your notes and queries are never uploaded. The one network request kvault makes is a
+once-a-day look at crates.io for a newer release (see [Upgrade notices](#upgrade-notices)),
+which one setting turns off. kvault never moves or rewrites your notes: the only files it writes are session notes, notes you `add`,
 and the pointer line `add` appends to `MEMORY.md` in a Claude Code memory dir.
 
 To work on kvault itself, clone the repository (`rust-toolchain.toml` pins Rust 1.95, which
@@ -119,6 +120,9 @@ recent_days = 14
 
 [query_log]
 enabled = true
+
+[update_check]
+enabled = true                         # once-a-day look for a newer release
 ```
 
 `kvault init` writes the memory root and whichever of the other two exist, plus any
@@ -297,6 +301,30 @@ query text, paths or project names), so it can be sent to someone else as it is,
 `--json` makes several people's reports easy to pool. `kvault report --full` prints the
 log lines themselves, which do contain query text and file paths: read it before sharing.
 
+### Upgrade notices
+
+The plugin updates through Claude Code; the binary updates only when you run
+`cargo install kvault`. The `SessionStart` hook tells you when they need attention, in a
+`systemMessage` you see and the model does not:
+
+- **Plugin newer than the binary.** The hook reads the plugin's `plugin.json` (from
+  `CLAUDE_PLUGIN_ROOT`) and says so every session until the binary is upgraded, since the
+  plugin's hooks may need the newer binary. No network; hooks copied into
+  `settings.json` by hand skip it.
+- **A newer release on crates.io.** Shown once per release, and in `kvault status` after
+  that.
+
+No hook waits on the network. The hook reads a cached answer (`latest-release.json`
+beside the hook log); when that is a day old it marks it checked and starts a detached
+`kvault update-check --quiet`, then returns. That child runs one `curl` of the crate's
+sparse-index file (`https://index.crates.io/kv/au/kvault`) with a 3-second timeout and a
+generic user agent; nothing about you, your notes or your queries is sent. Offline, or
+without `curl`, there is simply no notice. Other commands never touch the network:
+`kvault status` reads the cache, and `kvault update-check` asks crates.io when you run it.
+
+`[update_check] enabled = false` or `KVAULT_NO_UPDATE_CHECK=1` turns the release check
+off. The plugin check stays on: it costs one small file read.
+
 ## CLI
 
 ```
@@ -309,7 +337,8 @@ kvault get <id|path>[:from[:count]]          print a chunk or line window
 kvault brief [--cwd P] [--budget N]          what the SessionStart hook injects
 kvault add --title T [--kind K] [--tags a,b] write a note and index it
 kvault list [--project P] [--recent N]       indexed documents, newest first
-kvault status                                roots, counts, absent roots, index age
+kvault status                                version, roots, counts, absent roots, index age
+kvault update-check [--quiet]                ask crates.io now for a newer release
 kvault report [--since 7d] [--json|--full]   what the query log says about a period
 kvault bench <queries.jsonl> [--baseline]    retrieval quality over a query file
 kvault hook session-start|stop|pre-compact   Claude Code hook entry points
