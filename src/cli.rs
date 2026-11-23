@@ -149,6 +149,12 @@ pub enum Command {
         #[arg(value_enum)]
         event: HookEvent,
     },
+    /// Ask crates.io now whether a newer kvault release exists
+    UpdateCheck {
+        /// Print nothing (how the `SessionStart` hook runs it)
+        #[arg(long, short)]
+        quiet: bool,
+    },
     /// Start the MCP stdio server
     #[cfg(feature = "mcp")]
     Serve,

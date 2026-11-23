@@ -12,6 +12,9 @@ fn kvault() -> Command {
     cmd.env("KVAULT_DB", "/nonexistent/kvault-index.db");
     // Nor the session notes and logs under their home directory.
     cmd.env("HOME", "/nonexistent/home");
+    // Nor crates.io, nor an installed plugin's manifest.
+    cmd.env("KVAULT_NO_UPDATE_CHECK", "1");
+    cmd.env_remove("CLAUDE_PLUGIN_ROOT");
     for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
         cmd.env_remove(var);
     }
@@ -121,6 +124,8 @@ fn bad_config_is_a_clear_error() {
 fn at_home(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("kvault").unwrap();
     cmd.env("HOME", home);
+    cmd.env("KVAULT_NO_UPDATE_CHECK", "1");
+    cmd.env_remove("CLAUDE_PLUGIN_ROOT");
     for var in [
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -267,4 +272,66 @@ fn root_add_needs_a_config() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("kvault init"));
+}
+
+#[test]
+fn plugin_manifest_version_matches_the_crate() {
+    // The hooks compare the two: a release that bumps one must bump both.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude-plugin/plugin.json"),
+    )
+    .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn update_check_reports_a_newer_release_and_status_shows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = tmp.path().join("index-file");
+    std::fs::write(
+        &index,
+        r#"{"name":"kvault","vers":"99.0.0","yanked":false}
+{"name":"kvault","vers":"100.0.0","yanked":true}"#,
+    )
+    .unwrap();
+    let log = tmp.path().join("hooks.log");
+    let url = format!("file://{}", index.display());
+    kvault()
+        .env("KVAULT_LOG", &log)
+        .env("KVAULT_UPDATE_URL", &url)
+        .arg("update-check")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kvault 99.0.0 is available"));
+    kvault()
+        .env("KVAULT_LOG", &log)
+        .env_remove("KVAULT_NO_UPDATE_CHECK")
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "99.0.0 is available: cargo install kvault",
+        ));
+    kvault()
+        .env("KVAULT_LOG", &log)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(release check off)"));
+}
+
+#[test]
+fn update_check_fails_cleanly_when_the_fetch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    kvault()
+        .env("KVAULT_LOG", tmp.path().join("hooks.log"))
+        .env(
+            "KVAULT_UPDATE_URL",
+            format!("file://{}/missing", tmp.path().display()),
+        )
+        .arg("update-check")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("update check"));
 }

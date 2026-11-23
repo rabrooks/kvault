@@ -17,7 +17,7 @@ use kvault::recall::RecallOptions;
 use kvault::roots::RootKind;
 use kvault::search::{Query, SearchOptions};
 use kvault::store::Store;
-use kvault::{get, hooks, render, roots};
+use kvault::{get, hooks, render, roots, update};
 
 /// Write to stdout, ending the process quietly when the reader has gone
 /// away (`kvault status | head`): `print!` would panic on the closed pipe.
@@ -141,6 +141,7 @@ fn run(command: Command) -> kvault::Result<()> {
             Ok(())
         }
         Command::Report { since, json, full } => report(since.as_deref(), json, full),
+        Command::UpdateCheck { quiet } => update_check(quiet),
         Command::Links { .. } => not_yet("links", Milestone::M5Graph),
         Command::Bench {
             file,
@@ -152,6 +153,26 @@ fn run(command: Command) -> kvault::Result<()> {
         #[cfg(feature = "mcp")]
         Command::Serve => not_yet("serve", Milestone::M6Mcp),
     }
+}
+
+fn update_check(quiet: bool) -> kvault::Result<()> {
+    let path = update::cache_path()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("no state directory for the update check")))?;
+    let latest = update::refresh(&path)?;
+    if !quiet {
+        let now = update::current();
+        match latest {
+            Some(v) if update::Version::parse(now).is_some_and(|n| v > n) => {
+                outln!(
+                    "kvault {v} is available (you have {now}): {}",
+                    update::UPGRADE_COMMAND
+                );
+            }
+            Some(v) => outln!("kvault {now} is up to date (latest release {v})"),
+            None => outln!("kvault {now}: no releases found"),
+        }
+    }
+    Ok(())
 }
 
 fn not_yet(command: &'static str, milestone: Milestone) -> kvault::Result<()> {
@@ -540,6 +561,8 @@ fn status() -> kvault::Result<()> {
             "  (not found, using defaults)"
         }
     );
+
+    outln!("version: {}", update::status_line(&config));
 
     let expanded = roots::expand_config(&config);
     outln!(
