@@ -20,6 +20,7 @@ use, not the question's:
 
 - bare words match any, prefix-matched: `lambda cold start`
 - quotes make a phrase, `-word` excludes: `"cold start" -timeout`
+  (flags in a pasted command, `--release` or `-s`, are searched for, not excluded)
 - `tag:devops` filters; `tag:x` alone lists tagged notes newest first
 - `--budget` is tokens of output; 600 for a quick check, 1500 by default, 3000 when
   the answer is probably long

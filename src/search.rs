@@ -300,6 +300,10 @@ struct RawToken {
 }
 
 /// Split on whitespace, honouring double quotes and a leading `-`.
+///
+/// A `-` excludes only when a word of two or more letters or digits, or a
+/// quoted phrase, follows it directly. Queries are often pasted commands, and
+/// `--release`, `-s` or `-1` name the thing asked about: they stay positive.
 fn scan(s: &str) -> Vec<RawToken> {
     let mut out = Vec::new();
     let mut chars = s.chars().peekable();
@@ -310,10 +314,20 @@ fn scan(s: &str) -> Vec<RawToken> {
         }
         let mut negated = false;
         if c == '-' {
-            chars.next();
-            match chars.peek() {
-                Some(n) if !n.is_whitespace() => negated = true,
-                _ => continue,
+            let mut ahead = chars.clone();
+            ahead.next();
+            match ahead.peek() {
+                Some(&n) if n == '"' || n.is_alphanumeric() => {
+                    chars.next();
+                    negated = true;
+                }
+                // `--flag`: punctuation in front of a positive word.
+                Some(n) if !n.is_whitespace() => {}
+                // A dash on its own.
+                _ => {
+                    chars.next();
+                    continue;
+                }
             }
         }
         let mut quoted = false;
@@ -335,6 +349,10 @@ fn scan(s: &str) -> Vec<RawToken> {
                 text.push(n);
                 chars.next();
             }
+        }
+        // `-s`, `-1`: a flag or a number, not an exclusion.
+        if negated && !quoted && text.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+            negated = false;
         }
         out.push(RawToken {
             text,
@@ -1292,6 +1310,38 @@ mod tests {
             q.fts_strict().as_deref(),
             Some(r#"("lambda"* AND "cold"* AND "start"*)"#)
         );
+    }
+
+    /// Pasted commands: a flag names what is asked about, it does not
+    /// exclude it.
+    #[test]
+    fn flags_and_numbers_are_not_exclusions() {
+        let q = Query::parse("cargo build --release fails");
+        assert!(q.negative.is_empty(), "{:?}", q.negative);
+        assert_eq!(
+            q.fts_strict().as_deref(),
+            Some(r#"("cargo"* AND "build"* AND "release"* AND "fails"*)"#)
+        );
+        for raw in [
+            "git commit -s",
+            "exit code -1",
+            "rebase --onto main",
+            "ls -- path",
+        ] {
+            let q = Query::parse(raw);
+            assert!(q.negative.is_empty(), "{raw}: {:?}", q.negative);
+        }
+        assert!(
+            Query::parse("git commit -s")
+                .positive
+                .contains(&term("s", false))
+        );
+        assert!(Query::parse("--").is_empty());
+
+        // A word of two or more characters right after one dash still excludes.
+        let q = Query::parse("deploy -v2 -tag:x");
+        assert_eq!(q.negative, vec![term("v2", false)]);
+        assert_eq!(q.excluded_tags, vec!["x".to_owned()]);
     }
 
     #[test]
