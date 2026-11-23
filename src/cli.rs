@@ -3,11 +3,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "kvault",
-    version,
-    about = "Local-first knowledge index for coding agents"
-)]
+#[command(name = "kvault", version, about = "Shared memory for coding agents")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

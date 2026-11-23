@@ -1,4 +1,4 @@
-//! kvault: a local-first knowledge index for coding agents.
+//! kvault: shared memory for coding agents, built from markdown notes.
 //!
 //! Markdown files on disk are the only source of truth. kvault derives a
 //! disposable `SQLite` index (`FTS5` over heading-level chunks, links, tags) and
